@@ -42,7 +42,37 @@ docker run -d --name kamailio_iwf \
   kamailio-smpp-iwf /usr/local/sbin/kamailio -DD -E -f /usr/local/etc/kamailio/kamailio.cfg
 ```
 
-### 4. İstemci Testi
+### 4. Çoklu SMPP Sunucu & İstemci Bind Mimarisi (Multi-Bind)
+**Soru: Birden fazla SMPP sunucusuna aynı anda bağlanabilir ve birden fazla istemci bind kabul edebilir mi?**
+**Cevap: Evet, kesinlikle! Mimarimiz tam bir havuz (connection pool) şeklinde çalışır:**
+1. **Çoklu Outbound SMSC Bağlantısı (ESME Mode):** Kamailio aynı anda onlarca farklı operatöre (Turkcell, Vodafone, TT, yurtdışı SMSC'ler) paralel `transceiver (TRX)` olarak bağlanabilir. Her bağlantı bağımsız soket ve oturum durum makinesi (`smpp_client_conn_t`) ile yönetilir.
+2. **Çoklu Inbound İstemci Bağlantısı (SMSC Server Mode):** Dışarıdan bağlanan onlarca müşteri veya uygulama (ESME) aynı anda Kamailio'ya `bind_transceiver` yapabilir (`max_binds` limitiyle korunur).
+
+### 5. Lua Scripting (KEMI) ile Akıllı Yönlendirme
+Kamailio'nun yerel **Lua KEMI (`app_lua`)** motoru ile karmaşık telekom yönlendirmelerini doğrudan Lua fonksiyonlarıyla yapabilirsiniz:
+
+```lua
+-- examples/app.lua
+function ksr_request_route()
+    if KSR.is_MESSAGE() then
+        local dst = KSR.pv.get("$rU")
+        local src = KSR.pv.get("$fU")
+        local body = KSR.pv.get("$rb")
+
+        -- Numara Prefixine Göre Operatör Dağıtımı (LCR)
+        if string.sub(dst, 1, 4) == "9053" then
+            KSR.smpp.send("turkcell_smsc", src, dst, body)
+        elseif string.sub(dst, 1, 4) == "9054" then
+            KSR.smpp.send("vodafone_smsc", src, dst, body)
+        else
+            KSR.smpp.send("global_smsc", src, dst, body)
+        end
+        KSR.sl.send_reply(200, "SMS Accepted")
+    end
+end
+```
+
+### 6. İstemci Testi
 Kamailio SMS-IWF varsayılan olarak `2779` portunda dinler:
 ```bash
 python3 examples/test_client.py
@@ -91,7 +121,37 @@ It eliminates the need for middleman SMS gateways (such as Kannel or Jasmin), ro
 +---------------+----------------------+----------------------+-------------+-------------+
 ```
 
-### 4. Configuration Reference (`kamailio.cfg`)
+### 4. Multi-Bind & Connection Pooling Architecture
+**Can Kamailio bind to multiple SMPP SMSCs simultaneously and accept multiple inbound client binds?**
+**Yes, absolutely.** The module is engineered with a carrier-grade multi-session pooling architecture:
+- **Multi-SMSC Outbound Pooling (ESME Mode):** Kamailio can establish parallel `bind_transceiver` sessions to multiple upstream carriers (e.g. `sim1`, `sim2`, `sim3`, `sim4`). Each carrier connection maintains its own independent socket, sequence counter, keepalive timer, and state machine (`smpp_client_conn_t`).
+- **Concurrent Inbound Client Binds (SMSC Server Mode):** Multiple distinct ESME clients or concurrent binds from the same account can connect simultaneously to Kamailio's listener port (governed by the `max_binds` configuration per account).
+
+### 5. Lua KEMI Scripting Integration
+With Kamailio KEMI (`app_lua`), you can write SMS routing, Least Cost Routing (LCR), and protocol translation logic natively in Lua:
+
+```lua
+-- examples/app.lua
+function ksr_request_route()
+    if KSR.is_MESSAGE() then
+        local src = KSR.pv.get("$fU")
+        local dst = KSR.pv.get("$rU")
+        local body = KSR.pv.get("$rb")
+
+        -- Prefix-based LCR Routing across multiple SMPP SMSC connections
+        if string.sub(dst, 1, 4) == "9053" then
+            KSR.smpp.send("sim1", src, dst, body) -- Turkcell Carrier
+        elseif string.sub(dst, 1, 4) == "9054" then
+            KSR.smpp.send("sim2", src, dst, body) -- Vodafone Carrier
+        else
+            KSR.smpp.send("sim3", src, dst, body) -- Global Carrier
+        end
+        KSR.sl.send_reply(200, "SMS Accepted by KEMI")
+    end
+end
+```
+
+### 6. Configuration Reference (`kamailio.cfg`)
 
 ```kamailio
 loadmodule "smpp.so"
@@ -112,7 +172,7 @@ request_route {
 }
 ```
 
-### 5. Running the Unit & Verification Test Suite
+### 7. Running the Unit & Verification Test Suite
 
 ```bash
 clang -Wall -Wextra -O2 \
