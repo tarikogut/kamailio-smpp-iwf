@@ -1,0 +1,6 @@
+*.o
+*.so
+*.d
+*.lst
+test_smpp
+.DS_Store
