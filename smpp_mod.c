@@ -23,6 +23,8 @@
 #include "smpp_client.h"
 #include "smpp_server.h"
 #include "smpp_interwork.h"
+#include "smpp_dlr.h"
+#include "smpp_mnp.h"
 #include "smpp_pv.h"
 #include "smpp_rpc.h"
 
@@ -71,6 +73,10 @@ static param_export_t params[] = {
     {"db_url",                 PARAM_STRING, &smpp_db_url},
     {"default_client_mps",     PARAM_INT,    &smpp_default_client_mps},
     {"msgid_format",           PARAM_STRING, &smpp_msgid_format},
+    {"mnp_mode",               PARAM_INT,    &smpp_mnp_mode},
+    {"enum_suffix",            PARAM_STRING, &smpp_enum_suffix},
+    {"mnp_redis_host",         PARAM_STRING, &smpp_mnp_redis_host},
+    {"mnp_cache_ttl",          PARAM_INT,    &smpp_mnp_cache_ttl},
     {0, 0, 0}
 };
 
@@ -102,6 +108,7 @@ static int mod_init(void)
     smpp_ratelimit_init();
     smpp_config_init();
     smpp_client_init();
+    smpp_mnp_init();
     smpp_init_rpc();
 
     /* Initialize default anti-fraud rules */
@@ -196,6 +203,7 @@ static void destroy(void)
     smpp_client_destroy();
     smpp_config_destroy();
     smpp_ratelimit_destroy();
+    smpp_mnp_destroy();
     smpp_blacklist_clear_rules();
 }
 
@@ -213,8 +221,20 @@ static int on_server_submit(smpp_server_session_t *sess, const smpp_msg_t *msg, 
     LM_INFO("SMPP Server received SUBMIT_SM from '%s' to '%s': '%s'\n",
             msg->source_addr, msg->destination_addr, body);
 
-    /* Route to connected SMSC client (default sim1 or based on destination) */
-    smpp_client_conn_t *conn = smpp_client_find("sim1");
+    /* Route via ENUM / MNP Resolution Engine */
+    smpp_client_conn_t *conn = NULL;
+    smpp_mnp_result_t mnp_res;
+    if (smpp_mnp_lookup(msg->destination_addr, &mnp_res) == 0 && *mnp_res.target_smsc) {
+        conn = smpp_client_find(mnp_res.target_smsc);
+        if (conn) {
+            LM_INFO("MNP/ENUM resolved destination '%s' to SMSC '%s' (RN: %s, Operator: %s, Ported: %d)\n",
+                    msg->destination_addr, mnp_res.target_smsc, mnp_res.routing_number,
+                    mnp_res.operator_name, mnp_res.is_ported);
+        }
+    }
+
+    /* Fallback to default pool if MNP returned no active trunk */
+    if (!conn) conn = smpp_client_find("sim1");
     if (!conn) conn = smpp_client_find("sim2");
     if (!conn) conn = smpp_client_find("sim3");
     if (!conn) conn = smpp_client_find("sim4");
@@ -311,10 +331,33 @@ static int ki_smpp_send(sip_msg_t *msg, str *smsc, str *src, str *dst, str *text
     return 1;
 }
 
+static str ki_smpp_mnp_lookup(sip_msg_t *msg, str *msisdn)
+{
+    static char target_buf[32];
+    str res = {target_buf, 0};
+    if (!msisdn || msisdn->len == 0) return res;
+
+    char num_str[64];
+    size_t l = msisdn->len < sizeof(num_str) - 1 ? msisdn->len : sizeof(num_str) - 1;
+    memcpy(num_str, msisdn->s, l);
+    num_str[l] = '\0';
+
+    smpp_mnp_result_t mnp_res;
+    if (smpp_mnp_lookup(num_str, &mnp_res) == 0) {
+        strncpy(target_buf, mnp_res.target_smsc, sizeof(target_buf) - 1);
+        target_buf[sizeof(target_buf) - 1] = '\0';
+        res.len = strlen(target_buf);
+    }
+    return res;
+}
+
 static sr_kemi_t sr_kemi_smpp_exports[] = {
     {str_init("smpp"), str_init("send"),
         SR_KEMIP_INT, ki_smpp_send,
         {SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE}},
+    {str_init("smpp"), str_init("mnp_lookup"),
+        SR_KEMIP_STR, ki_smpp_mnp_lookup,
+        {SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE}},
     {{0, 0}, {0, 0}, 0, NULL, {0, 0, 0, 0, 0, 0}}
 };
 

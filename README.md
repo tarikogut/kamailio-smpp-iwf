@@ -21,6 +21,7 @@
 - **Özelleştirilebilir Mesaj ID (Custom MsgID Pattern):** Müşteri hesabı bazlı veya genel şablon motoru (`%PREFIX%`, `%ACCOUNT%`, `%TIMESTAMP%`, `%HEXSEQ%`, `%DECSEQ%`).
 - **Token Bucket MPS Hız Sınırlaması (Rate Limiting):** Her müşteri için saniye başına mesaj sınırı (MPS) enforce edilir, sınır aşıldığında anında `ESME_RTHROTTLED` (0x58) döner.
 - **Kara Liste & Sahtecilik Filtresi (Anti-Fraud):** Regex ve anahtar kelime eşleşmesi ile zararlı/kumar mesajları anında `ESME_RMSGBLOCKED` (0x67) ile reddedilir.
+- **ENUM & MNP (Numara Taşınabilirliği) Motoru:** RFC 3761 `e164.arpa` DNS ENUM, yerel yüksek hızlı bellek içi hash tablosu veya Redis dip sorgusu ile taşınmış numaraları tespit eder. Numaranın güncel operatörünü (Routing Number / RN) bularak SMS'i doğrudan doğru operatör trunk'ına (`sim1`, `sim2`, `sim3`) yönlendirir.
 - **Sıfır Kesintiyle Canlı Güncelleme:** `kamcmd smpp.reload` ile oturumları koparmadan bellek içi hesaplar, operatörler ve kara listeler anında güncellenir.
 
 ### 3. Hızlı Kurulum & Çalıştırma (Docker)
@@ -101,6 +102,7 @@ It eliminates the need for middleman SMS gateways (such as Kannel or Jasmin), ro
 - **Account-Based Message ID Template Customization:** Flexible pattern engine (`%PREFIX%-%TIMESTAMP%-%HEXSEQ%` or per-account patterns).
 - **In-Memory Token Bucket MPS Rate Limiter:** Per-account strict throttling with instant `ESME_RTHROTTLED` (`0x58`) and v5.0 `congestion_state` TLV feedback.
 - **Anti-Fraud & Regex Blacklist Engine:** Drops or rejects spam/phishing with `ESME_RMSGBLOCKED` (`0x67`).
+- **ENUM & MNP (Mobile Number Portability) Engine:** Supports RFC 3761 `e164.arpa` DNS ENUM, high-speed in-memory hash tables, or Redis database dips to identify ported numbers. Dynamically queries the recipient's Routing Number (RN) and routes SMS to the destination carrier (`sim1`, `sim2`, `sim3`) with optimal LCR cost.
 - **Zero-Downtime Hot Reloading:** Live configuration reload without dropping active TCP binds via `kamcmd smpp.reload`.
 
 ### 3. Architecture

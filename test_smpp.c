@@ -411,6 +411,42 @@ static void test_dlr_normalization(void)
     smpp_tlv_free_list(tlv_msg.tlvs);
 }
 
+/* 12. Test ENUM & MNP Resolution Engine */
+#include "smpp_mnp.h"
+static void test_mnp_and_enum(void)
+{
+    printf("\n--- Test Suite 12: ENUM & MNP Number Portability Resolution ---\n");
+
+    smpp_mnp_init();
+
+    /* 1. Test E.164 to ENUM Reverse FQDN mapping (RFC 3761) */
+    char enum_domain[128];
+    int rc = smpp_mnp_e164_to_enum_domain("+905321234567", "e164.arpa", enum_domain, sizeof(enum_domain));
+    TEST_ASSERT(rc == 0, "smpp_mnp_e164_to_enum_domain succeeds");
+    TEST_ASSERT(strcmp(enum_domain, "7.6.5.4.3.2.1.2.3.5.0.9.e164.arpa") == 0,
+                "E.164 correctly reversed with dots into e164.arpa");
+
+    /* 2. Test native prefix routing (unported) */
+    smpp_mnp_result_t res_native;
+    rc = smpp_mnp_lookup("905329998877", &res_native);
+    TEST_ASSERT(rc == 0, "Native prefix lookup succeeds");
+    TEST_ASSERT(strcmp(res_native.target_smsc, "sim1") == 0, "90532... routes natively to sim1 (Turkcell)");
+    TEST_ASSERT(res_native.is_ported == 0, "Marked as unported");
+
+    /* 3. Test Ported Number (MNP Rule: Turkcell 0532 number ported to Vodafone sim2) */
+    rc = smpp_mnp_add_rule("905321112233", "sim2", "B002", "VODAFONE");
+    TEST_ASSERT(rc == 0, "smpp_mnp_add_rule succeeds");
+
+    smpp_mnp_result_t res_ported;
+    rc = smpp_mnp_lookup("905321112233", &res_ported);
+    TEST_ASSERT(rc == 0, "Ported number lookup succeeds");
+    TEST_ASSERT(strcmp(res_ported.target_smsc, "sim2") == 0, "Ported 90532... correctly redirected to sim2 (Vodafone)");
+    TEST_ASSERT(strcmp(res_ported.routing_number, "B002") == 0, "Extracted RN matches B002");
+    TEST_ASSERT(res_ported.is_ported == 1, "Correctly flagged as ported (is_ported = 1)");
+
+    smpp_mnp_destroy();
+}
+
 int main(void)
 {
     printf("====================================================\n");
@@ -428,6 +464,7 @@ int main(void)
     test_smsc_server_processing();
     test_interworking_and_ims();
     test_dlr_normalization();
+    test_mnp_and_enum();
 
     printf("\n====================================================\n");
     printf("Total Tests: %d | Passed: %d | Failed: %d\n",
