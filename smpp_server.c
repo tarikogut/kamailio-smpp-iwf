@@ -8,6 +8,8 @@
 #include "smpp_ratelimit.h"
 #include "smpp_manip.h"
 #include "smpp_concat.h"
+#include "smpp_charging.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -271,7 +273,23 @@ int smpp_server_handle_pdu(smpp_server_session_t *sess, const uint8_t *in_buf, s
                     status = fraud_err ? fraud_err : ESME_RMSGBLOCKED;
                 }
             }
+
+            /* 3. Charging & Credit Check */
+            if (status == ESME_ROK) {
+                int has_udh = (in_pdu.body.msg.esm_class & 0x40) ? 1 : 0;
+                int segs = smpp_calc_segments(in_pdu.body.msg.sm_length, in_pdu.body.msg.data_coding, has_udh);
+                if (segs <= 0) segs = 1;
+
+                uint32_t rem_credit = 0;
+                if (smpp_charging_check_credit(sess->account_id,
+                                              in_pdu.body.msg.source_addr,
+                                              in_pdu.body.msg.destination_addr,
+                                              segs, &rem_credit) != 0) {
+                    status = ESME_RINVCREDIT;
+                }
+            }
         }
+
 
         smpp_header_init(&resp_pdu.header, SMPP_CMD_SUBMIT_SM_RESP, status, seq);
         if (status == ESME_ROK) {
@@ -348,7 +366,14 @@ int smpp_server_handle_pdu(smpp_server_session_t *sess, const uint8_t *in_buf, s
             if (cb) {
                 cb(sess, &in_pdu.body.msg, resp_pdu.body.msg_resp.message_id);
             }
+
+            int has_udh = (in_pdu.body.msg.esm_class & 0x40) ? 1 : 0;
+            int segs = smpp_calc_segments(in_pdu.body.msg.sm_length, in_pdu.body.msg.data_coding, has_udh);
+            if (segs <= 0) segs = 1;
+            smpp_charging_deduct_credit(sess->account_id, in_pdu.body.msg.source_addr, in_pdu.body.msg.destination_addr, segs, 0.0);
         }
+
+
         break;
     }
 

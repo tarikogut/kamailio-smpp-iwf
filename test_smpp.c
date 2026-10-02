@@ -19,8 +19,9 @@
 #include "smpp_config.h"
 #include "smpp_server.h"
 #include "smpp_interwork.h"
+#include "smpp_charging.h"
 #include "smpp_http_api.h"
-#include "smpp_concat.h"
+
 
 char *smpp_msgid_format = "%PREFIX%-%TIMESTAMP%-%HEXSEQ%";
 int smpp_http_api_enable = 1;
@@ -743,274 +744,410 @@ static void test_dynamic_ton_npi(void)
     pthread_cond_destroy(&sim_conn.resp_cond);
 }
 
-/* Global capture for server deliver callback in test */
-static int test_server_deliver_called = 0;
-static char test_server_deliver_body[2048] = {0};
-
-static int on_test_server_deliver(smpp_server_session_t *sess, const smpp_msg_t *msg)
+/* 15. Test Charging & Credit Control Subsystem */
+static void test_charging_and_credit_control(void)
 {
-    (void)sess;
-    test_server_deliver_called = 1;
-    if (msg) {
-        size_t l = msg->sm_length < sizeof(test_server_deliver_body) - 1 ? msg->sm_length : sizeof(test_server_deliver_body) - 1;
-        memcpy(test_server_deliver_body, msg->short_message, l);
-        test_server_deliver_body[l] = '\0';
+    printf("\n=== Running Test Suite 15: Charging & Credit Control Subsystem ===\n");
+
+    smpp_charging_init();
+    TEST_ASSERT(smpp_charging_get_mode() == SMPP_CHARGING_MODE_LOCAL, "Default charging mode is LOCAL");
+
+    /* Default seeded balances */
+    double bal = 0.0;
+    int rc = smpp_charging_get_balance("kamailio_client", &bal);
+    TEST_ASSERT(rc == 0 && bal == 1000.0, "Pre-seeded account kamailio_client has 1000.0 credit");
+
+    rc = smpp_charging_get_balance("test_esme", &bal);
+    TEST_ASSERT(rc == 0 && bal == 500.0, "Pre-seeded account test_esme has 500.0 credit");
+
+    /* Custom balance set and query */
+    rc = smpp_charging_set_balance("prepaid_user", 10.0);
+    TEST_ASSERT(rc == 0, "smpp_charging_set_balance succeeds");
+    rc = smpp_charging_get_balance("prepaid_user", &bal);
+    TEST_ASSERT(rc == 0 && bal == 10.0, "prepaid_user balance is 10.0");
+
+    /* Price per segment configuration */
+    rc = smpp_charging_set_price_per_segment("prepaid_user", 2.0);
+    TEST_ASSERT(rc == 0, "smpp_charging_set_price_per_segment succeeds");
+    double price = smpp_charging_get_price_per_segment("prepaid_user");
+    TEST_ASSERT(price == 2.0, "smpp_charging_get_price_per_segment returns 2.0");
+
+    /* Credit check: 1 segment cost = 2.0, balance = 10.0 -> OK */
+    uint32_t rem_credit = 0;
+    rc = smpp_charging_check_credit("prepaid_user", "90532111", "90532222", 1, &rem_credit);
+    TEST_ASSERT(rc == 0, "Credit check passes for 1 segment (cost 2.0 <= balance 10.0)");
+    TEST_ASSERT(rem_credit == 10, "Remaining credit reported as 10");
+
+    /* Deduct 1 segment (cost 2.0) */
+    rc = smpp_charging_deduct_credit("prepaid_user", "90532111", "90532222", 1, 2.0);
+    TEST_ASSERT(rc == 0, "smpp_charging_deduct_credit succeeds");
+    smpp_charging_get_balance("prepaid_user", &bal);
+    TEST_ASSERT(bal == 8.0, "Balance reduced to 8.0 after deduction");
+
+    /* Multi-segment check: 5 segments * 2.0 = 10.0. Balance is 8.0 -> FAILS */
+    rc = smpp_charging_check_credit("prepaid_user", "90532111", "90532222", 5, &rem_credit);
+    TEST_ASSERT(rc != 0, "Credit check fails for 5 segments (cost 10.0 > balance 8.0)");
+    TEST_ASSERT(rem_credit == 8, "Remaining credit reported as 8");
+
+    /* Credit deduction fails if balance insufficient */
+    rc = smpp_charging_deduct_credit("prepaid_user", "90532111", "90532222", 5, 10.0);
+    TEST_ASSERT(rc != 0, "smpp_charging_deduct_credit rejected due to insufficient balance");
+    smpp_charging_get_balance("prepaid_user", &bal);
+    TEST_ASSERT(bal == 8.0, "Balance remained intact at 8.0 after rejected deduction");
+
+    /* Add credit / refill */
+    rc = smpp_charging_add_credit("prepaid_user", 20.0, &bal);
+    TEST_ASSERT(rc == 0 && bal == 28.0, "smpp_charging_add_credit refilled balance to 28.0");
+
+    /* Check credit passes now for 5 segments */
+    rc = smpp_charging_check_credit("prepaid_user", "90532111", "90532222", 5, &rem_credit);
+    TEST_ASSERT(rc == 0, "Credit check passes after refill (cost 10.0 <= balance 28.0)");
+
+    /* Deplete balance completely */
+    smpp_charging_set_balance("prepaid_user", 0.0);
+    rc = smpp_charging_check_credit("prepaid_user", "90532111", "90532222", 1, &rem_credit);
+    TEST_ASSERT(rc != 0, "Credit check fails when balance is 0.0");
+    TEST_ASSERT(rem_credit == 0, "Remaining credit reported as 0");
+
+    /* Test Server SUBMIT_SM reject with ESME_RINVCREDIT (0x68) */
+    smpp_account_profile_t acc_test;
+    memset(&acc_test, 0, sizeof(acc_test));
+    strcpy(acc_test.account_id, "prepaid_user");
+    strcpy(acc_test.password, "pass");
+    acc_test.mps_limit = 50;
+    acc_test.burst_limit = 100;
+    smpp_config_add_account(&acc_test);
+
+    smpp_server_session_t sess;
+    memset(&sess, 0, sizeof(sess));
+    strcpy(sess.account_id, "prepaid_user");
+    sess.state = SMPP_STATE_BOUND_TRX;
+
+    smpp_pdu_t sub_pdu;
+    memset(&sub_pdu, 0, sizeof(sub_pdu));
+    smpp_header_init(&sub_pdu.header, SMPP_CMD_SUBMIT_SM, ESME_ROK, 2001);
+    strcpy(sub_pdu.body.msg.source_addr, "90532111");
+    strcpy(sub_pdu.body.msg.destination_addr, "90532222");
+    const char *test_txt = "Test Submit SM for Credit Check";
+    sub_pdu.body.msg.sm_length = (uint8_t)strlen(test_txt);
+    memcpy(sub_pdu.body.msg.short_message, test_txt, sub_pdu.body.msg.sm_length);
+
+    uint8_t pdu_buf[1024];
+    size_t pdu_len = 0;
+    smpp_pdu_pack(&sub_pdu, pdu_buf, sizeof(pdu_buf), &pdu_len);
+
+    uint8_t out_resp[1024];
+    size_t out_resp_len = 0;
+    rc = smpp_server_handle_pdu(&sess, pdu_buf, pdu_len, out_resp, sizeof(out_resp), &out_resp_len);
+    TEST_ASSERT(rc == 0 && out_resp_len > 0, "smpp_server_handle_pdu processed SUBMIT_SM");
+
+    smpp_pdu_t resp_pdu;
+    smpp_pdu_unpack(out_resp, out_resp_len, &resp_pdu);
+    TEST_ASSERT(resp_pdu.header.command_id == SMPP_CMD_SUBMIT_SM_RESP, "Server responded with SUBMIT_SM_RESP");
+    TEST_ASSERT(resp_pdu.header.command_status == ESME_RINVCREDIT, "Server rejected submit_sm with ESME_RINVCREDIT (0x68)");
+    smpp_pdu_free(&resp_pdu);
+
+    /* Refill prepaid_user and retry submit_sm */
+    smpp_charging_set_balance("prepaid_user", 50.0);
+    out_resp_len = 0;
+    rc = smpp_server_handle_pdu(&sess, pdu_buf, pdu_len, out_resp, sizeof(out_resp), &out_resp_len);
+    smpp_pdu_unpack(out_resp, out_resp_len, &resp_pdu);
+    TEST_ASSERT(resp_pdu.header.command_status == ESME_ROK, "Server accepted submit_sm after credit refill (ESME_ROK)");
+    smpp_pdu_free(&resp_pdu);
+
+    smpp_charging_get_balance("prepaid_user", &bal);
+    TEST_ASSERT(bal == 48.0, "Credit automatically deducted from balance after submit_sm (now 48.0)");
+    smpp_pdu_free(&sub_pdu);
+}
+
+/* 16. Test Diameter Ro CCR / CCA Protocol Engine */
+static int mock_diameter_hook_called = 0;
+static int mock_diameter_hook_units = 0;
+static int mock_diameter_hook(const uint8_t *req, size_t req_len, uint8_t *resp, size_t max_resp, size_t *resp_len)
+{
+    mock_diameter_hook_called++;
+    smpp_diameter_ccr_t ccr;
+    if (smpp_diameter_unpack_ccr(req, req_len, &ccr) != 0) return -1;
+    mock_diameter_hook_units = (int)ccr.requested_units;
+
+    smpp_diameter_cca_t cca;
+    memset(&cca, 0, sizeof(cca));
+    strncpy(cca.session_id, ccr.session_id, sizeof(cca.session_id) - 1);
+    cca.request_type = ccr.request_type;
+    cca.request_number = ccr.request_number;
+    cca.hop_by_hop = ccr.hop_by_hop;
+    cca.end_to_end = ccr.end_to_end;
+
+    /* Enforce rule: max 4 units granted */
+    if (ccr.requested_units <= 4) {
+        cca.result_code = DIAMETER_SUCCESS; /* 2001 */
+        cca.granted_units = ccr.requested_units;
+        cca.remaining_balance = 100.0;
+    } else {
+        cca.result_code = DIAMETER_CREDIT_LIMIT_REACHED; /* 4012 */
+        cca.granted_units = 0;
+        cca.remaining_balance = 0.0;
     }
+    return smpp_diameter_pack_cca(&cca, resp, max_resp, resp_len);
+}
+
+static void test_diameter_ro_charging(void)
+{
+    printf("\n=== Running Test Suite 16: Diameter Ro Credit Control (3GPP TS 32.299 / RFC 4006) ===\n");
+
+    /* 1. Test CCR packing and structure */
+    smpp_diameter_ccr_t ccr;
+    memset(&ccr, 0, sizeof(ccr));
+    strcpy(ccr.session_id, "diam-test-session-101");
+    strcpy(ccr.origin_host, "smpp-gw.local");
+    strcpy(ccr.origin_realm, "local");
+    strcpy(ccr.destination_realm, "local");
+    strcpy(ccr.account_id, "905321234567");
+    strcpy(ccr.src_msisdn, "905321234567");
+    strcpy(ccr.dst_msisdn, "905327654321");
+    ccr.request_type = CC_REQUEST_TYPE_EVENT_RECORD; /* 4 */
+    ccr.request_number = 0;
+    ccr.requested_action = REQUESTED_ACTION_DIRECT_DEBITING; /* 0 */
+    ccr.requested_units = 3;
+    ccr.hop_by_hop = 0xAABBCCDD;
+    ccr.end_to_end = 0x11223344;
+
+    uint8_t ccr_buf[512];
+    size_t ccr_len = 0;
+    int rc = smpp_diameter_pack_ccr(&ccr, ccr_buf, sizeof(ccr_buf), &ccr_len);
+    TEST_ASSERT(rc == 0 && ccr_len > 20, "smpp_diameter_pack_ccr succeeds");
+    TEST_ASSERT(ccr_buf[0] == 1, "Diameter Version is 1 (RFC 6733)");
+    TEST_ASSERT((ccr_buf[4] & DIAMETER_FLAG_REQUEST) != 0, "Diameter Header R-bit (Request) set");
+
+    /* 2. Test CCR unpacking */
+    smpp_diameter_ccr_t u_ccr;
+    rc = smpp_diameter_unpack_ccr(ccr_buf, ccr_len, &u_ccr);
+    TEST_ASSERT(rc == 0, "smpp_diameter_unpack_ccr succeeds");
+    TEST_ASSERT(strcmp(u_ccr.session_id, "diam-test-session-101") == 0, "Session-Id AVP matches");
+    TEST_ASSERT(u_ccr.request_type == CC_REQUEST_TYPE_EVENT_RECORD, "CC-Request-Type is EVENT_RECORD (4)");
+    TEST_ASSERT(u_ccr.requested_units == 3, "CC-Service-Specific-Units extracted is 3");
+    TEST_ASSERT(u_ccr.hop_by_hop == 0xAABBCCDD, "Hop-by-Hop identifier preserved");
+
+    /* 3. Test CCA packing and unpacking */
+    smpp_diameter_cca_t cca;
+    memset(&cca, 0, sizeof(cca));
+    strcpy(cca.session_id, "diam-test-session-101");
+    cca.result_code = DIAMETER_SUCCESS; /* 2001 */
+    cca.request_type = CC_REQUEST_TYPE_EVENT_RECORD;
+    cca.request_number = 0;
+    cca.granted_units = 3;
+    cca.hop_by_hop = 0xAABBCCDD;
+    cca.end_to_end = 0x11223344;
+
+    uint8_t cca_buf[512];
+    size_t cca_len = 0;
+    rc = smpp_diameter_pack_cca(&cca, cca_buf, sizeof(cca_buf), &cca_len);
+    TEST_ASSERT(rc == 0 && cca_len > 20, "smpp_diameter_pack_cca succeeds");
+    TEST_ASSERT((cca_buf[4] & DIAMETER_FLAG_REQUEST) == 0, "Diameter Answer R-bit cleared");
+
+    smpp_diameter_cca_t u_cca;
+    rc = smpp_diameter_unpack_cca(cca_buf, cca_len, &u_cca);
+    TEST_ASSERT(rc == 0, "smpp_diameter_unpack_cca succeeds");
+    TEST_ASSERT(u_cca.result_code == DIAMETER_SUCCESS, "Result-Code is DIAMETER_SUCCESS (2001)");
+    TEST_ASSERT(u_cca.granted_units == 3, "Granted units is 3");
+
+    /* 4. Test Switching to Diameter Mode with transport hook */
+    smpp_charging_set_mode(SMPP_CHARGING_MODE_DIAMETER);
+    TEST_ASSERT(smpp_charging_get_mode() == SMPP_CHARGING_MODE_DIAMETER, "Charging mode set to DIAMETER");
+
+    mock_diameter_hook_called = 0;
+    mock_diameter_hook_units = 0;
+    smpp_charging_set_diameter_hook(mock_diameter_hook);
+
+    /* 2 units requested -> passes hook rule (<= 4) */
+    uint32_t rem = 0;
+    rc = smpp_charging_check_credit("905321234567", "905321234567", "905327654321", 2, &rem);
+    TEST_ASSERT(rc == 0, "Diameter credit check passes (Result-Code 2001)");
+    TEST_ASSERT(mock_diameter_hook_called == 1, "Diameter transport hook was invoked");
+    TEST_ASSERT(mock_diameter_hook_units == 2, "Diameter hook received 2 requested units");
+
+    /* 8 units requested -> exceeds hook limit, returns 4012 -> fails */
+    rc = smpp_charging_check_credit("905321234567", "905321234567", "905327654321", 8, &rem);
+    TEST_ASSERT(rc != 0, "Diameter credit check rejected (Result-Code 4012 Credit Limit Reached)");
+    TEST_ASSERT(mock_diameter_hook_called == 2, "Diameter transport hook was invoked a 2nd time");
+
+    /* Deduct credit via Diameter hook */
+    rc = smpp_charging_deduct_credit("905321234567", "905321234567", "905327654321", 2, 0.0);
+    TEST_ASSERT(rc == 0, "Diameter direct debiting succeeds");
+
+    /* Clean up hook & restore local mode */
+    smpp_charging_set_diameter_hook(NULL);
+    smpp_charging_set_mode(SMPP_CHARGING_MODE_LOCAL);
+}
+
+/* 17. Test REST API Balance Query & Refill Endpoints */
+static void test_rest_api_balance_and_charging(void)
+{
+    printf("\n=== Running Test Suite 17: REST API Balance Query & Refill Endpoints ===\n");
+
+    smpp_charging_set_mode(SMPP_CHARGING_MODE_LOCAL);
+    smpp_charging_set_balance("api_client_1", 100.0);
+
+    char resp_buf[2048];
+    size_t resp_len = 0;
+
+    /* 1. GET /api/v1/accounts/balance?id=api_client_1 */
+    const char *req_bal = 
+        "GET /api/v1/accounts/balance?id=api_client_1 HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n";
+    int rc = smpp_http_api_handle_request(req_bal, strlen(req_bal), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "GET /api/v1/accounts/balance handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "Balance query returns 200 OK");
+    TEST_ASSERT(strstr(resp_buf, "\"balance\":100.00") != NULL, "Response reports balance 100.00");
+    TEST_ASSERT(strstr(resp_buf, "\"currency\":\"CREDIT\"") != NULL, "Response reports CREDIT currency");
+
+    /* 2. GET /api/v1/accounts/balance without id -> 400 Bad Request */
+    const char *req_bad_bal = 
+        "GET /api/v1/accounts/balance HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_bad_bal, strlen(req_bad_bal), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0 && strstr(resp_buf, "400 Bad Request") != NULL, "Balance query without ID returns 400 Bad Request");
+
+    /* 3. GET /api/v1/accounts/balance for unknown account -> 404 Not Found */
+    const char *req_unknown_bal = 
+        "GET /api/v1/accounts/balance?id=unknown_xyz HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_unknown_bal, strlen(req_unknown_bal), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0 && strstr(resp_buf, "404 Not Found") != NULL, "Unknown account returns 404 Not Found");
+
+    /* 4. POST /api/v1/accounts/balance (Refill Credit) */
+    const char *refill_payload = "{\"account_id\":\"api_client_1\",\"add_credit\":500.0}";
+    char req_refill[1024];
+    snprintf(req_refill, sizeof(req_refill),
+        "POST /api/v1/accounts/balance HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n%s", strlen(refill_payload), refill_payload);
+    rc = smpp_http_api_handle_request(req_refill, strlen(req_refill), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "POST /api/v1/accounts/balance handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "Balance refill returns 200 OK");
+    TEST_ASSERT(strstr(resp_buf, "\"balance\":600.00") != NULL, "Balance updated from 100 to 600.00");
+    TEST_ASSERT(strstr(resp_buf, "\"added_credit\":500.00") != NULL, "Response confirms added_credit 500.00");
+
+    /* 5. Depleted Account: Create account with 0.0 balance */
+    smpp_charging_set_balance("broke_user", 0.0);
+    const char *send_no_credit = 
+        "{\"account_id\":\"broke_user\",\"smsc\":\"sim1\",\"from\":\"broke_user\",\"to\":\"905321112233\",\"text\":\"No money text\"}";
+    char req_send_fail[1024];
+    snprintf(req_send_fail, sizeof(req_send_fail),
+        "POST /api/v1/sms/send HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n%s", strlen(send_no_credit), send_no_credit);
+    rc = smpp_http_api_handle_request(req_send_fail, strlen(req_send_fail), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "POST /api/v1/sms/send handled for depleted account");
+    TEST_ASSERT(strstr(resp_buf, "402 Payment Required") != NULL, "REST API returns 402 Payment Required when balance is 0");
+    TEST_ASSERT(strstr(resp_buf, "0x68") != NULL, "Response error mentions ESME_RINVCREDIT (0x68)");
+
+    /* 6. Refill broke_user and verify successful transmission */
+    const char *refill_broke = "{\"account_id\":\"broke_user\",\"add_credit\":50.0}";
+    snprintf(req_refill, sizeof(req_refill),
+        "POST /api/v1/accounts/balance HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n%s", strlen(refill_broke), refill_broke);
+    smpp_http_api_handle_request(req_refill, strlen(req_refill), resp_buf, sizeof(resp_buf), &resp_len);
+
+    rc = smpp_http_api_handle_request(req_send_fail, strlen(req_send_fail), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "POST /api/v1/sms/send retried after credit refill");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "REST API send returns 200 OK after refill");
+    TEST_ASSERT(strstr(resp_buf, "\"status\":\"accepted\"") != NULL, "SMS accepted for delivery");
+
+    double broke_bal = 0.0;
+    smpp_charging_get_balance("broke_user", &broke_bal);
+    TEST_ASSERT(broke_bal == 49.0, "Credit deducted by 1.0 (now 49.0)");
+}
+
+/* 18. Test SMPP-to-SIP Mobile Originated (MO) SMS Interworking */
+static int test_sip_dispatch_count = 0;
+static char test_sip_last_src[64] = {0};
+static char test_sip_last_dst[64] = {0};
+static char test_sip_last_body[256] = {0};
+static int mock_sip_dispatcher_cb(const char *src, const char *dst, const char *body, size_t body_len, const char *raw_sip, size_t raw_len)
+{
+    (void)raw_sip;
+    (void)raw_len;
+    test_sip_dispatch_count++;
+    strncpy(test_sip_last_src, src, sizeof(test_sip_last_src) - 1);
+    strncpy(test_sip_last_dst, dst, sizeof(test_sip_last_dst) - 1);
+    size_t l = body_len < sizeof(test_sip_last_body) - 1 ? body_len : sizeof(test_sip_last_body) - 1;
+    memcpy(test_sip_last_body, body, l);
+    test_sip_last_body[l] = '\0';
     return 0;
 }
 
-/* 15. Test Multipart / Concatenated SMS (SAR & UDH) Segmentation and Reassembly */
-static void test_multipart_segmentation_reassembly(void)
+static void test_mo_smpp_to_sip_interworking(void)
 {
-    printf("\n=== Running Test Suite 15: Multipart / Concatenated SMS (SAR & UDH) ===\n");
+    printf("\n=== Running Test Suite 18: SMPP-to-SIP MO SMS Interworking (RFC 3428) ===\n");
 
-    /* 1. Single SMS limit (GSM <= 160 characters) */
-    const char *short_gsm = "This is a short single GSM message that fits easily within standard 160 chars.";
-    smpp_msg_t segs_single[8];
-    int n = smpp_split_message((const uint8_t *)short_gsm, strlen(short_gsm), SMPP_ENCODING_DEFAULT, 1, 10, segs_single, 8);
-    TEST_ASSERT(n == 1, "smpp_split_message returns 1 segment for message <= 160 GSM chars");
-    TEST_ASSERT(segs_single[0].esm_class == 0, "Single GSM segment does not set UDHI");
-    TEST_ASSERT(segs_single[0].sm_length == strlen(short_gsm), "Single GSM segment length matches input");
-    TEST_ASSERT(memcmp(segs_single[0].short_message, short_gsm, strlen(short_gsm)) == 0, "Single GSM segment payload matches");
+    /* 1. Test smpp_build_sip_message format */
+    char sip_buf[2048];
+    size_t sip_len = 0;
+    const char *sample_body = "Hello SIP user from SMPP!";
+    int rc = smpp_build_sip_message("905321000000", "905322000000", sample_body, strlen(sample_body),
+                                    "kamailio.local", sip_buf, sizeof(sip_buf), &sip_len);
+    TEST_ASSERT(rc == 0 && sip_len > 0, "smpp_build_sip_message generated SIP request");
+    TEST_ASSERT(strstr(sip_buf, "MESSAGE sip:905322000000@kamailio.local SIP/2.0") != NULL,
+                "Request-Line contains MESSAGE sip:dst@domain SIP/2.0");
+    TEST_ASSERT(strstr(sip_buf, "From: <sip:905321000000@kamailio.local>") != NULL,
+                "From header contains <sip:src@domain>");
+    TEST_ASSERT(strstr(sip_buf, "To: <sip:905322000000@kamailio.local>") != NULL,
+                "To header contains <sip:dst@domain>");
+    TEST_ASSERT(strstr(sip_buf, "Content-Type: text/plain; charset=UTF-8") != NULL,
+                "Content-Type is text/plain; charset=UTF-8");
+    TEST_ASSERT(strstr(sip_buf, "Content-Length: 25") != NULL,
+                "Content-Length matches body length (25)");
+    TEST_ASSERT(strstr(sip_buf, sample_body) != NULL,
+                "SIP MESSAGE body matches input short_message");
 
-    /* 2. Single SMS limit (UCS-2 <= 70 characters / 140 bytes) */
-    uint8_t ucs2_short[140];
-    for (int i = 0; i < 140; i++) ucs2_short[i] = (uint8_t)(i & 0xFF);
-    n = smpp_split_message(ucs2_short, 140, SMPP_ENCODING_UCS2, 1, 11, segs_single, 8);
-    TEST_ASSERT(n == 1, "smpp_split_message returns 1 segment for message <= 70 UCS-2 chars (140 bytes)");
-    TEST_ASSERT(segs_single[0].esm_class == 0, "Single UCS-2 segment does not set UDHI");
-    TEST_ASSERT(segs_single[0].sm_length == 140, "Single UCS-2 segment length matches input");
+    /* 2. Test destination address with sip: prefix and explicit domain */
+    rc = smpp_build_sip_message("sip:alice", "sip:bob@ims.operator.com", "Test body", 9,
+                                "default.domain", sip_buf, sizeof(sip_buf), &sip_len);
+    TEST_ASSERT(rc == 0, "smpp_build_sip_message handles sip: and @ domain parsing");
+    TEST_ASSERT(strstr(sip_buf, "MESSAGE sip:bob@ims.operator.com SIP/2.0") != NULL,
+                "Destination user bob and host ims.operator.com extracted correctly");
+    TEST_ASSERT(strstr(sip_buf, "From: <sip:alice@ims.operator.com>") != NULL,
+                "From header uses parsed destination domain");
 
-    /* 3. GSM 7-bit UDH segmentation (> 160 chars) */
-    char gsm_long[321];
-    for (int i = 0; i < 320; i++) gsm_long[i] = 'A' + (i % 26);
-    gsm_long[320] = '\0';
+    /* 3. Test smpp_to_sip_message with dispatcher hook */
+    test_sip_dispatch_count = 0;
+    memset(test_sip_last_src, 0, sizeof(test_sip_last_src));
+    memset(test_sip_last_dst, 0, sizeof(test_sip_last_dst));
+    memset(test_sip_last_body, 0, sizeof(test_sip_last_body));
 
-    smpp_msg_t gsm_segs[8];
-    n = smpp_split_message((const uint8_t *)gsm_long, 320, SMPP_ENCODING_DEFAULT, 1, 0x4A, gsm_segs, 8);
-    TEST_ASSERT(n == 3, "320-char GSM message split into 3 segments (153 + 153 + 14)");
+    smpp_set_sip_dispatcher(mock_sip_dispatcher_cb);
+    TEST_ASSERT(smpp_get_sip_dispatcher() == mock_sip_dispatcher_cb, "smpp_set_sip_dispatcher registers callback");
 
-    /* Segment 1: UDH header + 153 chars = 159 bytes */
-    TEST_ASSERT(gsm_segs[0].esm_class == 0x40, "Segment 1 has UDHI bit (0x40) set");
-    TEST_ASSERT(gsm_segs[0].sm_length == 159, "Segment 1 sm_length is 159 (6 UDH + 153 payload)");
-    TEST_ASSERT(gsm_segs[0].short_message[0] == 0x05, "UDHL is 0x05");
-    TEST_ASSERT(gsm_segs[0].short_message[1] == 0x00, "IEI is 0x00 (Concatenated 8-bit ref)");
-    TEST_ASSERT(gsm_segs[0].short_message[2] == 0x03, "IEDL is 0x03");
-    TEST_ASSERT(gsm_segs[0].short_message[3] == 0x4A, "Ref num is 0x4A");
-    TEST_ASSERT(gsm_segs[0].short_message[4] == 3, "Total segments is 3");
-    TEST_ASSERT(gsm_segs[0].short_message[5] == 1, "Sequence number is 1");
-    TEST_ASSERT(memcmp(&gsm_segs[0].short_message[6], gsm_long, 153) == 0, "Segment 1 payload matches slice");
+    rc = smpp_to_sip_message("905329999999", "905328888888", "Inbound MO SMS Test", 19);
+    TEST_ASSERT(rc == 0, "smpp_to_sip_message returned success");
+    TEST_ASSERT(test_sip_dispatch_count == 1, "SIP dispatcher callback invoked once");
+    TEST_ASSERT(strcmp(test_sip_last_src, "905329999999") == 0, "Dispatcher received correct source MSISDN");
+    TEST_ASSERT(strcmp(test_sip_last_dst, "905328888888") == 0, "Dispatcher received correct destination MSISDN");
+    TEST_ASSERT(strcmp(test_sip_last_body, "Inbound MO SMS Test") == 0, "Dispatcher received correct body text");
 
-    /* Segment 2: UDH header + 153 chars = 159 bytes */
-    TEST_ASSERT(gsm_segs[1].esm_class == 0x40, "Segment 2 has UDHI bit set");
-    TEST_ASSERT(gsm_segs[1].sm_length == 159, "Segment 2 sm_length is 159");
-    TEST_ASSERT(gsm_segs[1].short_message[5] == 2, "Segment 2 sequence number is 2");
-    TEST_ASSERT(memcmp(&gsm_segs[1].short_message[6], gsm_long + 153, 153) == 0, "Segment 2 payload matches slice");
+    /* 4. Parameter validation */
+    TEST_ASSERT(smpp_to_sip_message(NULL, "dst", "body", 4) == -1, "NULL source rejected with -1");
+    TEST_ASSERT(smpp_to_sip_message("src", NULL, "body", 4) == -1, "NULL destination rejected with -1");
+    TEST_ASSERT(smpp_to_sip_message("src", "dst", NULL, 0) == -1, "NULL body rejected with -1");
 
-    /* Segment 3: UDH header + 14 chars = 20 bytes */
-    TEST_ASSERT(gsm_segs[2].esm_class == 0x40, "Segment 3 has UDHI bit set");
-    TEST_ASSERT(gsm_segs[2].sm_length == 20, "Segment 3 sm_length is 20 (6 UDH + 14 payload)");
-    TEST_ASSERT(gsm_segs[2].short_message[5] == 3, "Segment 3 sequence number is 3");
-    TEST_ASSERT(memcmp(&gsm_segs[2].short_message[6], gsm_long + 306, 14) == 0, "Segment 3 payload matches slice");
-
-    /* 4. UCS-2 UDH segmentation (> 70 chars / 140 bytes) */
-    uint8_t ucs2_long[200];
-    for (int i = 0; i < 200; i++) ucs2_long[i] = (uint8_t)(i & 0xFF);
-
-    smpp_msg_t ucs2_segs[8];
-    n = smpp_split_message(ucs2_long, 200, SMPP_ENCODING_UCS2, 1, 0x99, ucs2_segs, 8);
-    TEST_ASSERT(n == 2, "200-byte UCS-2 message split into 2 segments (134 + 66)");
-    TEST_ASSERT(ucs2_segs[0].esm_class == 0x40, "UCS-2 Segment 1 has UDHI bit set");
-    TEST_ASSERT(ucs2_segs[0].sm_length == 140, "UCS-2 Segment 1 sm_length is 140 (6 UDH + 134 payload)");
-    TEST_ASSERT(ucs2_segs[0].short_message[4] == 2, "UCS-2 Segment 1 total is 2");
-    TEST_ASSERT(ucs2_segs[0].short_message[5] == 1, "UCS-2 Segment 1 seq is 1");
-    TEST_ASSERT(ucs2_segs[1].sm_length == 72, "UCS-2 Segment 2 sm_length is 72 (6 UDH + 66 payload)");
-    TEST_ASSERT(ucs2_segs[1].short_message[5] == 2, "UCS-2 Segment 2 seq is 2");
-
-    /* 5. SAR TLV segmentation (> 254 bytes) */
-    uint8_t sar_long[600];
-    for (int i = 0; i < 600; i++) sar_long[i] = (uint8_t)(i % 251);
-
-    smpp_msg_t sar_segs[8];
-    n = smpp_split_message(sar_long, 600, SMPP_ENCODING_DEFAULT, 0, 0x1234, sar_segs, 8);
-    TEST_ASSERT(n == 3, "600-byte message split into 3 SAR segments (254 + 254 + 92)");
-    TEST_ASSERT(sar_segs[0].esm_class == 0x00, "SAR Segment 1 does NOT set UDHI in esm_class");
-    TEST_ASSERT(sar_segs[0].sm_length == 254, "SAR Segment 1 sm_length is 254");
-    TEST_ASSERT(sar_segs[1].sm_length == 254, "SAR Segment 2 sm_length is 254");
-    TEST_ASSERT(sar_segs[2].sm_length == 92, "SAR Segment 3 sm_length is 92");
-
-    /* Verify TLVs in SAR Segment 1 */
-    smpp_tlv_t *t_ref = smpp_tlv_find(sar_segs[0].tlvs, SMPP_TLV_SAR_MSG_REF_NUM);
-    smpp_tlv_t *t_tot = smpp_tlv_find(sar_segs[0].tlvs, SMPP_TLV_SAR_TOTAL_SEGMENTS);
-    smpp_tlv_t *t_seq = smpp_tlv_find(sar_segs[0].tlvs, SMPP_TLV_SAR_SEGMENT_SEQNUM);
-    TEST_ASSERT(t_ref != NULL && t_ref->length == 2, "SAR_MSG_REF_NUM attached with length 2");
-    TEST_ASSERT(t_tot != NULL && t_tot->value[0] == 3, "SAR_TOTAL_SEGMENTS attached with value 3");
-    TEST_ASSERT(t_seq != NULL && t_seq->value[0] == 1, "SAR_SEGMENT_SEQNUM attached with value 1");
-
-    /* 6. Message Concatenation Detection & Metadata Extraction */
-    TEST_ASSERT(smpp_msg_is_concat(&gsm_segs[0]) == 1, "smpp_msg_is_concat detects UDH (returns 1)");
-    TEST_ASSERT(smpp_msg_is_concat(&sar_segs[0]) == 2, "smpp_msg_is_concat detects SAR TLV (returns 2)");
-    TEST_ASSERT(smpp_msg_is_concat(&segs_single[0]) == 0, "smpp_msg_is_concat returns 0 for non-concatenated message");
-
-    uint16_t ex_ref = 0;
-    uint8_t ex_tot = 0, ex_seq = 0;
-    const uint8_t *ex_payload = NULL;
-    size_t ex_plen = 0;
-    int det_rc = smpp_msg_get_concat_info(&gsm_segs[0], &ex_ref, &ex_tot, &ex_seq, &ex_payload, &ex_plen);
-    TEST_ASSERT(det_rc == 1, "smpp_msg_get_concat_info succeeds on UDH segment");
-    TEST_ASSERT(ex_ref == 0x4A && ex_tot == 3 && ex_seq == 1, "Extracted UDH metadata matches (ref=0x4A, tot=3, seq=1)");
-    TEST_ASSERT(ex_plen == 153, "Extracted UDH payload length is 153");
-
-    det_rc = smpp_msg_get_concat_info(&sar_segs[1], &ex_ref, &ex_tot, &ex_seq, &ex_payload, &ex_plen);
-    TEST_ASSERT(det_rc == 2, "smpp_msg_get_concat_info succeeds on SAR segment");
-    TEST_ASSERT(ex_ref == 0x1234 && ex_tot == 3 && ex_seq == 2, "Extracted SAR metadata matches (ref=0x1234, tot=3, seq=2)");
-    TEST_ASSERT(ex_plen == 254, "Extracted SAR payload length is 254");
-
-    /* 7. In-Memory Segment Reassembly (In-Order) */
-    smpp_reassembly_init(60);
-    uint8_t assembled_buf[2048];
-    size_t assembled_len = 0;
-
-    /* Feed Segment 1 of 3 (UDH payload) */
-    int r_rc = smpp_reassembly_add_part(0x4A, 3, 1, &gsm_segs[0].short_message[6], 153, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 0, "Segment 1/3 buffered, reassembly pending (returns 0)");
-
-    /* Feed Segment 2 of 3 */
-    r_rc = smpp_reassembly_add_part(0x4A, 3, 2, &gsm_segs[1].short_message[6], 153, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 0, "Segment 2/3 buffered, reassembly pending (returns 0)");
-
-    /* Feed Segment 3 of 3 */
-    r_rc = smpp_reassembly_add_part(0x4A, 3, 3, &gsm_segs[2].short_message[6], 14, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 1, "Segment 3/3 triggers reassembly completion (returns 1)");
-    TEST_ASSERT(assembled_len == 320, "Reassembled length matches original 320 characters");
-    TEST_ASSERT(memcmp(assembled_buf, gsm_long, 320) == 0, "Reassembled payload matches original full message");
-
-    /* 8. In-Memory Segment Reassembly (Out-Of-Order) */
-    memset(assembled_buf, 0, sizeof(assembled_buf));
-    assembled_len = 0;
-
-    /* Feed Segment 2 first (out of 2) */
-    r_rc = smpp_reassembly_add_part(0x77, 2, 2, (const uint8_t *)"WORLD!", 6, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 0, "Out-of-order part 2/2 buffered (returns 0)");
-
-    /* Feed Segment 1 second */
-    r_rc = smpp_reassembly_add_part(0x77, 2, 1, (const uint8_t *)"HELLO ", 6, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 1, "Out-of-order part 1/2 triggers completion (returns 1)");
-    TEST_ASSERT(assembled_len == 12, "Reassembled out-of-order length is 12");
-    TEST_ASSERT(memcmp(assembled_buf, "HELLO WORLD!", 12) == 0, "Reassembled payload correctly ordered: 'HELLO WORLD!'");
-
-    /* 9. Duplicate Segment Handling */
-    r_rc = smpp_reassembly_add_part(0x88, 2, 1, (const uint8_t *)"PART1", 5, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 0, "First delivery of part 1 buffered (returns 0)");
-    r_rc = smpp_reassembly_add_part(0x88, 2, 1, (const uint8_t *)"PART1", 5, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 0, "Duplicate delivery of part 1 handled idempotently (returns 0)");
-    r_rc = smpp_reassembly_add_part(0x88, 2, 2, (const uint8_t *)"PART2", 5, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 1, "Part 2 completes reassembly after duplicate (returns 1)");
-    TEST_ASSERT(assembled_len == 10 && memcmp(assembled_buf, "PART1PART2", 10) == 0, "Payload assembled without corruption");
-
-    /* 10. End-to-End PDU Reassembly: smpp_reassemble_msg with SAR TLVs */
-    memset(assembled_buf, 0, sizeof(assembled_buf));
-    assembled_len = 0;
-
-    r_rc = smpp_reassemble_msg(&sar_segs[0], assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 0, "smpp_reassemble_msg on SAR seg 1/3 pending (returns 0)");
-    r_rc = smpp_reassemble_msg(&sar_segs[1], assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 0, "smpp_reassemble_msg on SAR seg 2/3 pending (returns 0)");
-    r_rc = smpp_reassemble_msg(&sar_segs[2], assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 1, "smpp_reassemble_msg on SAR seg 3/3 complete (returns 1)");
-    TEST_ASSERT(assembled_len == 600, "smpp_reassemble_msg output length matches 600 bytes");
-    TEST_ASSERT(memcmp(assembled_buf, sar_long, 600) == 0, "smpp_reassemble_msg output matches full 600-byte payload");
-
-    /* 11. TTL Expiration */
-    smpp_reassembly_ctx_t *ttl_ctx = smpp_reassembly_ctx_create(1); /* 1 second TTL */
-    TEST_ASSERT(ttl_ctx != NULL, "smpp_reassembly_ctx_create with 1s TTL succeeds");
-    r_rc = smpp_reassembly_ctx_add_part(ttl_ctx, 0x9999, 2, 1, (const uint8_t *)"TEMP", 4, assembled_buf, sizeof(assembled_buf), &assembled_len);
-    TEST_ASSERT(r_rc == 0, "Part 1 of expiring message buffered");
-    TEST_ASSERT(ttl_ctx->entries != NULL, "Entry is currently present in context");
-    sleep(2); /* Wait past TTL */
-    smpp_reassembly_ctx_cleanup(ttl_ctx);
-    TEST_ASSERT(ttl_ctx->entries == NULL, "Expired segment pruned after TTL expiration");
-    smpp_reassembly_ctx_destroy(ttl_ctx);
-
-    /* 12. Server Engine DELIVER_SM Reassembly */
-    smpp_server_session_t srv_sess;
-    memset(&srv_sess, 0, sizeof(srv_sess));
-    srv_sess.state = SMPP_STATE_BOUND_TRX;
-    strcpy(srv_sess.account_id, "test_client");
-
-    test_server_deliver_called = 0;
-    test_server_deliver_body[0] = '\0';
-    smpp_server_set_deliver_cb(on_test_server_deliver);
-
-    /* Construct 2 DELIVER_SM PDUs with UDH */
-    smpp_pdu_t pdu1, pdu2;
-    memset(&pdu1, 0, sizeof(pdu1));
-    memset(&pdu2, 0, sizeof(pdu2));
-    smpp_header_init(&pdu1.header, SMPP_CMD_DELIVER_SM, ESME_ROK, 501);
-    smpp_header_init(&pdu2.header, SMPP_CMD_DELIVER_SM, ESME_ROK, 502);
-    strcpy(pdu1.body.msg.source_addr, "905320000001");
-    strcpy(pdu1.body.msg.destination_addr, "905320000002");
-    strcpy(pdu2.body.msg.source_addr, "905320000001");
-    strcpy(pdu2.body.msg.destination_addr, "905320000002");
-
-    pdu1.body.msg.esm_class = 0x40;
-    pdu1.body.msg.short_message[0] = 0x05;
-    pdu1.body.msg.short_message[1] = 0x00;
-    pdu1.body.msg.short_message[2] = 0x03;
-    pdu1.body.msg.short_message[3] = 0x33;
-    pdu1.body.msg.short_message[4] = 2;
-    pdu1.body.msg.short_message[5] = 1;
-    memcpy(&pdu1.body.msg.short_message[6], "KAMAILIO-", 9);
-    pdu1.body.msg.sm_length = 6 + 9;
-
-    pdu2.body.msg.esm_class = 0x40;
-    pdu2.body.msg.short_message[0] = 0x05;
-    pdu2.body.msg.short_message[1] = 0x00;
-    pdu2.body.msg.short_message[2] = 0x03;
-    pdu2.body.msg.short_message[3] = 0x33;
-    pdu2.body.msg.short_message[4] = 2;
-    pdu2.body.msg.short_message[5] = 2;
-    memcpy(&pdu2.body.msg.short_message[6], "MULTIPART", 9);
-    pdu2.body.msg.sm_length = 6 + 9;
-
-    uint8_t pdu1_buf[512], pdu2_buf[512], resp1_buf[512], resp2_buf[512];
-    size_t pdu1_len = 0, pdu2_len = 0, resp1_len = 0, resp2_len = 0;
-    smpp_pdu_pack(&pdu1, pdu1_buf, sizeof(pdu1_buf), &pdu1_len);
-    smpp_pdu_pack(&pdu2, pdu2_buf, sizeof(pdu2_buf), &pdu2_len);
-
-    /* Process PDU 1 on server */
-    int srv_rc = smpp_server_handle_pdu(&srv_sess, pdu1_buf, pdu1_len, resp1_buf, sizeof(resp1_buf), &resp1_len);
-    TEST_ASSERT(srv_rc == 0, "Server processed DELIVER_SM segment 1 successfully");
-    TEST_ASSERT(test_server_deliver_called == 0, "Server deliver callback not triggered on incomplete segment 1");
-
-    /* Process PDU 2 on server */
-    srv_rc = smpp_server_handle_pdu(&srv_sess, pdu2_buf, pdu2_len, resp2_buf, sizeof(resp2_buf), &resp2_len);
-    TEST_ASSERT(srv_rc == 0, "Server processed DELIVER_SM segment 2 successfully");
-    TEST_ASSERT(test_server_deliver_called == 1, "Server deliver callback triggered on final segment");
-    TEST_ASSERT(strcmp(test_server_deliver_body, "KAMAILIO-MULTIPART") == 0,
-                "Server delivered reassembled message body 'KAMAILIO-MULTIPART'");
-
-    /* 13. Client Multi-Part Helper */
-    smpp_client_conn_t sim_client;
-    memset(&sim_client, 0, sizeof(sim_client));
-    strcpy(sim_client.smsc_id, "sim_test_concat");
-    sim_client.state = SMPP_STATE_BOUND_TRX;
-    sim_client.sock_fd = 9999; /* Mock non-existent fd */
-    pthread_mutex_init(&sim_client.resp_mutex, NULL);
-    pthread_cond_init(&sim_client.resp_cond, NULL);
-    char out_first_id[65] = {0};
-
-    int client_rc = smpp_client_send_multipart(&sim_client, "SENDER", "905321234567",
-                                               (const uint8_t *)gsm_long, 320, SMPP_ENCODING_DEFAULT, 1, out_first_id);
-    TEST_ASSERT(client_rc == -3, "smpp_client_send_multipart segments long text and attempts sequential send (-3 on test socket)");
-
-    pthread_mutex_destroy(&sim_client.resp_mutex);
-    pthread_cond_destroy(&sim_client.resp_cond);
-
-    /* Free allocations */
-    smpp_free_segments(sar_segs, 3);
-    smpp_pdu_free(&pdu1);
-    smpp_pdu_free(&pdu2);
+    smpp_set_sip_dispatcher(NULL);
 }
 
 
@@ -1019,6 +1156,8 @@ int main(void)
     printf("====================================================\n");
     printf("Kamailio SMPP (SMS-IWF) Module - Verification Suite\n");
     printf("====================================================\n");
+
+    smpp_charging_init();
 
     test_pdu_pack_unpack();
     test_nli_detection();
@@ -1034,7 +1173,10 @@ int main(void)
     test_mnp_and_enum();
     test_rest_api_suite();
     test_dynamic_ton_npi();
-    test_multipart_segmentation_reassembly();
+    test_charging_and_credit_control();
+    test_diameter_ro_charging();
+    test_rest_api_balance_and_charging();
+    test_mo_smpp_to_sip_interworking();
 
     printf("\n====================================================\n");
     printf("Total Tests: %d | Passed: %d | Failed: %d\n",
@@ -1043,3 +1185,4 @@ int main(void)
 
     return (tests_run == tests_passed) ? 0 : 1;
 }
+

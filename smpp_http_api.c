@@ -9,6 +9,8 @@
 #include "smpp_client.h"
 #include "smpp_ratelimit.h"
 #include "smpp_manip.h"
+#include "smpp_charging.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -262,6 +264,32 @@ int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp
             return 0;
         }
 
+        char account_id[64] = "api_user";
+        if (body_start) {
+            if (json_extract_string(body_start, "account_id", account_id, sizeof(account_id)) != 0 &&
+                json_extract_string(body_start, "account", account_id, sizeof(account_id)) != 0) {
+                if (from_num[0] && smpp_charging_account_exists(from_num)) {
+                    strncpy(account_id, from_num, sizeof(account_id) - 1);
+                } else {
+                    strcpy(account_id, "api_user");
+                }
+            }
+        }
+
+        /* Credit Control & Charging Check */
+        int segs = smpp_calc_segments(strlen(text_str), SMPP_ENCODING_DEFAULT, 0);
+        if (segs <= 0) segs = 1;
+
+        uint32_t rem_credit = 0;
+        if (smpp_charging_check_credit(account_id, from_num, to_num, segs, &rem_credit) != 0) {
+            char json_err[256];
+            snprintf(json_err, sizeof(json_err),
+                "{\"error\":\"Payment Required\",\"message\":\"Insufficient credit balance\",\"error_code\":104,\"status_code\":\"0x68\",\"remaining_credit\":%u}",
+                rem_credit);
+            make_http_response(402, "Payment Required", json_err, resp_buf, max_resp, out_len);
+            return 0;
+        }
+
         /* Forward to connected SMSC */
         smpp_client_conn_t *conn = smpp_client_find(smsc_target);
         if (!conn) conn = smpp_client_find("sim1");
@@ -288,6 +316,7 @@ int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp
         }
 
         if (send_rc == 0) {
+            smpp_charging_deduct_credit(account_id, from_num, to_num, segs, 0.0);
             smpp_http_api_record_msg(out_mid, from_num, to_num, "ACCEPTED", conn ? conn->smsc_id : smsc_target);
             char json[512];
             snprintf(json, sizeof(json),
@@ -303,6 +332,7 @@ int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp
         }
         return 0;
     }
+
 
     /* 5. GET /api/v1/sms/query?id=... (Query DLR & Message Status) */
     if (strcmp(method, "GET") == 0 && strncmp(path, "/api/v1/sms/query", 17) == 0) {
@@ -531,7 +561,79 @@ int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp
         return 0;
     }
 
+    /* 13. GET /api/v1/accounts/balance?id=... (Check Account Credit Balance) */
+    if (strcmp(method, "GET") == 0 && strncmp(path, "/api/v1/accounts/balance", 24) == 0) {
+        char account_id[64] = {0};
+        char *id_param = strstr(path, "id=");
+        if (id_param) {
+            sscanf(id_param + 3, "%63[^& \t\r\n]", account_id);
+        }
+
+        if (!account_id[0]) {
+            make_http_response(400, "Bad Request", "{\"error\":\"Missing 'id' parameter in query string\"}",
+                               resp_buf, max_resp, out_len);
+            return 0;
+        }
+
+        double bal = 0.0;
+        if (smpp_charging_get_balance(account_id, &bal) == 0) {
+            char json[256];
+            snprintf(json, sizeof(json),
+                "{\"status\":\"success\",\"account_id\":\"%s\",\"balance\":%.2f,\"currency\":\"CREDIT\"}",
+                account_id, bal);
+            make_http_response(200, "OK", json, resp_buf, max_resp, out_len);
+        } else {
+            make_http_response(404, "Not Found", "{\"error\":\"Account not found\"}",
+                               resp_buf, max_resp, out_len);
+        }
+        return 0;
+    }
+
+    /* 14. POST /api/v1/accounts/balance (Refill or Set Account Credit Balance) */
+    if (strcmp(method, "POST") == 0 && strncmp(path, "/api/v1/accounts/balance", 24) == 0) {
+        const char *body_start = strstr(req_buf, "\r\n\r\n");
+        if (!body_start) body_start = strstr(req_buf, "\n\n");
+        if (body_start) body_start += (body_start[0] == '\r') ? 4 : 2;
+
+        char account_id[64] = {0};
+        double add_credit = 0.0;
+        double set_balance = -1.0;
+
+        if (body_start) {
+            json_extract_string(body_start, "account_id", account_id, sizeof(account_id));
+            if (!account_id[0]) json_extract_string(body_start, "id", account_id, sizeof(account_id));
+
+            char *p_add = strstr(body_start, "\"add_credit\":");
+            if (p_add) sscanf(p_add, "\"add_credit\":%lf", &add_credit);
+
+            char *p_bal = strstr(body_start, "\"balance\":");
+            if (p_bal) sscanf(p_bal, "\"balance\":%lf", &set_balance);
+        }
+
+        if (!account_id[0]) {
+            make_http_response(400, "Bad Request", "{\"error\":\"Missing 'account_id' in JSON body\"}",
+                               resp_buf, max_resp, out_len);
+            return 0;
+        }
+
+        double new_bal = 0.0;
+        if (set_balance >= 0.0 && add_credit == 0.0) {
+            smpp_charging_set_balance(account_id, set_balance);
+            new_bal = set_balance;
+        } else {
+            smpp_charging_add_credit(account_id, add_credit, &new_bal);
+        }
+
+        char json[256];
+        snprintf(json, sizeof(json),
+            "{\"status\":\"success\",\"account_id\":\"%s\",\"balance\":%.2f,\"added_credit\":%.2f}",
+            account_id, new_bal, add_credit);
+        make_http_response(200, "OK", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
     make_http_response(404, "Not Found", "{\"error\":\"Endpoint not found\"}", resp_buf, max_resp, out_len);
+
     return 0;
 }
 

@@ -38,4 +38,19 @@ int smpp_ims_rp_data_pack(const char *src_msisdn, const char *dst_msisdn,
                           const char *text_utf8, uint8_t *out_rp_buf,
                           size_t max_out, size_t *out_len);
 
+/* 3. SMPP -> SIP MO (Mobile Originated) Interworking (RFC 3428) */
+typedef int (*smpp_sip_dispatcher_cb_t)(const char *src_msisdn, const char *dst_msisdn,
+                                        const char *body, size_t body_len,
+                                        const char *raw_sip, size_t raw_len);
+
+void smpp_set_sip_dispatcher(smpp_sip_dispatcher_cb_t cb);
+smpp_sip_dispatcher_cb_t smpp_get_sip_dispatcher(void);
+
+int smpp_build_sip_message(const char *src_msisdn, const char *dst_msisdn,
+                           const char *body, size_t body_len,
+                           const char *domain,
+                           char *out_sip, size_t max_out, size_t *out_len);
+
+int smpp_to_sip_message(const char *src_msisdn, const char *dst_msisdn, const char *body, size_t body_len);
+
 #endif /* _SMPP_INTERWORK_H_ */
