@@ -29,6 +29,8 @@
 #include "smpp_pv.h"
 #include "smpp_rpc.h"
 
+#include "../../core/mod_fix.h"
+
 MODULE_VERSION
 
 /* Module Parameters */
@@ -58,11 +60,11 @@ static int w_smpp_prepend_prefix(struct sip_msg *msg, char *prefix);
 
 /* Exported Functions */
 static cmd_export_t cmds[] = {
-    {"smpp_send", (cmd_function)w_smpp_send, 4, 0, 0,
+    {"smpp_send", (cmd_function)w_smpp_send, 4, fixup_spve_all, fixup_free_spve_all,
         REQUEST_ROUTE | FAILURE_ROUTE | ONREPLY_ROUTE | BRANCH_ROUTE | LOCAL_ROUTE},
-    {"smpp_append_suffix", (cmd_function)w_smpp_append_suffix, 1, 0, 0,
+    {"smpp_append_suffix", (cmd_function)w_smpp_append_suffix, 1, fixup_spve_null, fixup_free_spve_null,
         REQUEST_ROUTE | FAILURE_ROUTE | ONREPLY_ROUTE | BRANCH_ROUTE | LOCAL_ROUTE},
-    {"smpp_prepend_prefix", (cmd_function)w_smpp_prepend_prefix, 1, 0, 0,
+    {"smpp_prepend_prefix", (cmd_function)w_smpp_prepend_prefix, 1, fixup_spve_null, fixup_free_spve_null,
         REQUEST_ROUTE | FAILURE_ROUTE | ONREPLY_ROUTE | BRANCH_ROUTE | LOCAL_ROUTE},
     {0, 0, 0, 0, 0, 0}
 };
@@ -203,6 +205,11 @@ static int mod_init(void)
 
     smpp_client_set_deliver_cb(on_client_deliver);
 
+    /* Start supervisor thread for auto-reconnect and keepalive */
+    smpp_client_start_supervisor(smpp_reconnect_interval, smpp_enquire_link_interval);
+    LM_INFO("SMPP Client Supervisor active (reconnect=%ds, keepalive=%ds)\n",
+            smpp_reconnect_interval, smpp_enquire_link_interval);
+
     return 0;
 }
 
@@ -321,49 +328,85 @@ static int on_server_submit(smpp_server_session_t *sess, const smpp_msg_t *msg, 
 
 static int w_smpp_send(struct sip_msg *msg, char *smsc, char *src, char *dst, char *text)
 {
-    if (!smsc || !dst || !text) {
-        LM_ERR("Invalid parameters to smpp_send\n");
+    str s_smsc = {0, 0};
+    str s_src = {0, 0};
+    str s_dst = {0, 0};
+    str s_text = {0, 0};
+
+    if (fixup_get_svalue(msg, (fparam_t *)smsc, &s_smsc) < 0) {
+        LM_ERR("Failed to evaluate smsc parameter\n");
+        return -1;
+    }
+    if (src && fixup_get_svalue(msg, (fparam_t *)src, &s_src) < 0) {
+        LM_ERR("Failed to evaluate src parameter\n");
+        return -1;
+    }
+    if (fixup_get_svalue(msg, (fparam_t *)dst, &s_dst) < 0) {
+        LM_ERR("Failed to evaluate dst parameter\n");
+        return -1;
+    }
+    if (fixup_get_svalue(msg, (fparam_t *)text, &s_text) < 0) {
+        LM_ERR("Failed to evaluate text parameter\n");
         return -1;
     }
 
+    char c_smsc[32] = {0};
+    size_t slen = s_smsc.len < 31 ? s_smsc.len : 31;
+    memcpy(c_smsc, s_smsc.s, slen);
+
+    char c_src[32] = {0};
+    if (s_src.s && s_src.len > 0) {
+        size_t srclen = s_src.len < 31 ? s_src.len : 31;
+        memcpy(c_src, s_src.s, srclen);
+    }
+
+    char c_dst[32] = {0};
+    size_t dlen = s_dst.len < 31 ? s_dst.len : 31;
+    memcpy(c_dst, s_dst.s, dlen);
+
+    char c_text[256] = {0};
+    size_t tlen = s_text.len < 255 ? s_text.len : 255;
+    memcpy(c_text, s_text.s, tlen);
+
     LM_INFO("smpp_send called: smsc='%s', src='%s', dst='%s', text='%s'\n",
-            smsc, src ? src : "", dst, text);
+            c_smsc, c_src, c_dst, c_text);
 
     /* In-flight context update */
     smpp_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    if (src) strncpy(ctx.src, src, sizeof(ctx.src) - 1);
-    strncpy(ctx.dst, dst, sizeof(ctx.dst) - 1);
-    strncpy(ctx.body, text, sizeof(ctx.body) - 1);
+    strncpy(ctx.src, c_src, sizeof(ctx.src) - 1);
+    strncpy(ctx.dst, c_dst, sizeof(ctx.dst) - 1);
+    strncpy(ctx.body, c_text, sizeof(ctx.body) - 1);
     smpp_ctx_set_current(&ctx);
 
-    smpp_client_conn_t *conn = smpp_client_find(smsc);
+    smpp_client_conn_t *conn = smpp_client_find(c_smsc);
     if (!conn) {
-        smpp_smsc_profile_t *p = smpp_config_find_smsc(smsc);
+        smpp_smsc_profile_t *p = smpp_config_find_smsc(c_smsc);
         if (p) {
             conn = smpp_client_connect(p);
         }
     }
 
     if (!conn) {
-        LM_ERR("SMSC '%s' not found or failed to connect\n", smsc);
+        LM_ERR("SMSC '%s' not found or failed to connect\n", c_smsc);
         return -1;
     }
 
     char out_msg_id[65] = {0};
     uint8_t sm_data[256];
-    uint8_t sm_len = (uint8_t)strlen(text);
+    uint8_t sm_len = (uint8_t)strlen(c_text);
     if (sm_len > 255) sm_len = 255;
-    memcpy(sm_data, text, sm_len);
+    memcpy(sm_data, c_text, sm_len);
 
-    int rc = smpp_client_send_submit_sm(conn, src, dst, sm_data, sm_len,
+    int rc = smpp_client_send_submit_sm(conn, c_src, c_dst, sm_data, sm_len,
                                         SMPP_ENCODING_DEFAULT, 0, NULL, out_msg_id);
     if (rc == 0) {
-        LM_INFO("smpp_send success to '%s': MsgID=%s\n", smsc, out_msg_id);
+        LM_INFO("smpp_send success to '%s': MsgID=%s\n", c_smsc, out_msg_id);
+        smpp_http_api_record_msg(out_msg_id, c_src[0] ? c_src : "SIP", c_dst, "SUBMITTED", c_smsc);
         return 1;
     }
 
-    LM_ERR("smpp_send to '%s' failed with error code %d\n", smsc, rc);
+    LM_ERR("smpp_send to '%s' failed with error code %d\n", c_smsc, rc);
     return -1;
 }
 
@@ -388,8 +431,33 @@ static int w_smpp_prepend_prefix(struct sip_msg *msg, char *prefix)
 /* KEMI Bindings */
 static int ki_smpp_send(sip_msg_t *msg, str *smsc, str *src, str *dst, str *text)
 {
-    LM_INFO("KEMI smpp.send: smsc='%.*s', dst='%.*s'\n", smsc->len, smsc->s, dst->len, dst->s);
-    return 1;
+    if (!smsc || !dst || !text || smsc->len == 0 || dst->len == 0 || text->len == 0) {
+        LM_ERR("KEMI smpp.send: invalid parameters\n");
+        return -1;
+    }
+
+    char smsc_buf[32] = {0};
+    size_t slen = smsc->len < 31 ? smsc->len : 31;
+    memcpy(smsc_buf, smsc->s, slen);
+
+    char src_buf[32] = {0};
+    if (src && src->len > 0) {
+        size_t srclen = src->len < 31 ? src->len : 31;
+        memcpy(src_buf, src->s, srclen);
+    }
+
+    char dst_buf[32] = {0};
+    size_t dlen = dst->len < 31 ? dst->len : 31;
+    memcpy(dst_buf, dst->s, dlen);
+
+    char txt_buf[256] = {0};
+    size_t tlen = text->len < 255 ? text->len : 255;
+    memcpy(txt_buf, text->s, tlen);
+
+    LM_INFO("KEMI smpp.send: smsc='%s', src='%s', dst='%s', text='%s'\n",
+            smsc_buf, src_buf, dst_buf, txt_buf);
+
+    return w_smpp_send((struct sip_msg *)msg, smsc_buf, src_buf, dst_buf, txt_buf);
 }
 
 static str ki_smpp_mnp_lookup(sip_msg_t *msg, str *msisdn)

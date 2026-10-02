@@ -65,8 +65,42 @@ def main():
 
     print(f"[+] SUBMIT_SM ACK received from Kamailio! Status=0x{r2_status:08X}, MsgID='{kamailio_msg_id}'")
     print(f"[+] Mesaj Kamailio SMS-IWF tarafindan sim1 (Melrose SMSC) simulatorune iletildi.")
+    print(f"[*] Waiting for DELIVER_SM (DLR) from Kamailio...")
+
+    dlr_received = False
+    start_wait = time.time()
+    s.settimeout(12.0)
+    try:
+        while time.time() - start_wait < 12.0:
+            dlr_pkt = s.recv(1024)
+            if not dlr_pkt or len(dlr_pkt) < 16:
+                break
+            d_len, d_id, d_status, d_seq = struct.unpack('>IIII', dlr_pkt[:16])
+            if d_id == 0x00000005:  # DELIVER_SM
+                print(f"[+] >>> DELIVER_SM (DLR) RECEIVED from Kamailio! Seq={d_seq}")
+                dlr_body = dlr_pkt[16:]
+                # Print receipt text if available
+                parts = dlr_body.split(b'\x00')
+                for p in parts:
+                    if b'id:' in p or b'stat:' in p:
+                        print(f"[+] DLR Content: '{p.decode('latin1', errors='ignore')}'")
+
+                # Send DELIVER_SM_RESP
+                resp_hdr = struct.pack('>IIII', 16, 0x80000005, 0, d_seq)
+                s.sendall(resp_hdr)
+                print(f"[+] Sent DELIVER_SM_RESP ACK back to Kamailio (Seq={d_seq})")
+                dlr_received = True
+                break
+    except socket.timeout:
+        print("[-] Timed out waiting for DLR.")
+
     s.close()
-    return 0
+    if dlr_received:
+        print("[SUCCESS] Full End-to-End Cycle Complete: BIND -> SUBMIT_SM -> SUBMIT_SM_RESP -> DELIVER_SM (DLR) -> DELIVER_SM_RESP!")
+        return 0
+    else:
+        print("[-] DLR not received within timeout")
+        return 1
 
 if __name__ == "__main__":
     sys.exit(main())

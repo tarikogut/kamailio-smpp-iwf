@@ -15,10 +15,17 @@
 #include <netdb.h>
 #include <errno.h>
 #include <pthread.h>
+#include <time.h>
 
 static smpp_client_conn_t *client_conns = NULL;
 static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
 static smpp_client_deliver_cb_t client_deliver_cb = NULL;
+
+/* Supervisor Thread Controls */
+static pthread_t supervisor_thread;
+static volatile int supervisor_running = 0;
+static int supervisor_reconnect_interval = 10;
+static int supervisor_enquire_interval = 30;
 
 void smpp_client_set_deliver_cb(smpp_client_deliver_cb_t cb)
 {
@@ -63,6 +70,18 @@ static void *client_rx_thread_func(void *arg)
                 if (cb) {
                     cb(conn->smsc_id, &pdu.body.msg);
                 }
+            } else if (pdu.header.command_id == SMPP_CMD_SUBMIT_SM_RESP) {
+                pthread_mutex_lock(&conn->resp_mutex);
+                if (pdu.header.sequence_number == conn->waiting_seq) {
+                    conn->resp_received = 1;
+                    conn->resp_status = pdu.header.command_status;
+                    if (pdu.header.command_status == ESME_ROK) {
+                        strncpy(conn->resp_msg_id, pdu.body.msg_resp.message_id, 64);
+                        conn->resp_msg_id[64] = '\0';
+                    }
+                    pthread_cond_broadcast(&conn->resp_cond);
+                }
+                pthread_mutex_unlock(&conn->resp_mutex);
             } else if (pdu.header.command_id == SMPP_CMD_ENQUIRE_LINK) {
                 smpp_pdu_t el_resp;
                 memset(&el_resp, 0, sizeof(el_resp));
@@ -72,10 +91,14 @@ static void *client_rx_thread_func(void *arg)
                 if (smpp_pdu_pack(&el_resp, el_tx, sizeof(el_tx), &el_tx_len) == 0) {
                     send(conn->sock_fd, el_tx, el_tx_len, 0);
                 }
+            } else if (pdu.header.command_id == SMPP_CMD_ENQUIRE_LINK_RESP) {
+                /* Keepalive response acknowledged */
             }
             smpp_pdu_free(&pdu);
         }
     }
+
+    conn->state = SMPP_STATE_DISCONNECTED;
     return NULL;
 }
 
@@ -87,15 +110,21 @@ int smpp_client_init(void)
     return 0;
 }
 
-
-
 void smpp_client_destroy(void)
 {
+    smpp_client_stop_supervisor();
+
     pthread_mutex_lock(&client_mutex);
     smpp_client_conn_t *curr = client_conns;
     while (curr) {
         smpp_client_conn_t *tmp = curr->next;
-        if (curr->sock_fd >= 0) close(curr->sock_fd);
+        curr->running = 0;
+        if (curr->sock_fd >= 0) {
+            close(curr->sock_fd);
+            curr->sock_fd = -1;
+        }
+        pthread_mutex_destroy(&curr->resp_mutex);
+        pthread_cond_destroy(&curr->resp_cond);
         free(curr);
         curr = tmp;
     }
@@ -119,12 +148,12 @@ smpp_client_conn_t *smpp_client_find(const char *smsc_id)
     return NULL;
 }
 
-smpp_client_conn_t *smpp_client_connect(const smpp_smsc_profile_t *profile)
+static int do_client_connect_and_bind(smpp_client_conn_t *conn)
 {
-    if (!profile) return NULL;
+    if (!conn) return -1;
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return NULL;
+    if (fd < 0) return -1;
 
     /* Set 5-second socket timeout */
     struct timeval tv;
@@ -136,44 +165,34 @@ smpp_client_conn_t *smpp_client_connect(const smpp_smsc_profile_t *profile)
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(profile->port);
+    serv_addr.sin_port = htons(conn->profile.port);
 
-    if (inet_pton(AF_INET, profile->host, &serv_addr.sin_addr) <= 0) {
-        struct hostent *he = gethostbyname(profile->host);
+    if (inet_pton(AF_INET, conn->profile.host, &serv_addr.sin_addr) <= 0) {
+        struct hostent *he = gethostbyname(conn->profile.host);
         if (!he) {
             close(fd);
-            return NULL;
+            return -2;
         }
         memcpy(&serv_addr.sin_addr, he->h_addr_list[0], he->h_length);
     }
 
     if (connect(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         close(fd);
-        return NULL;
+        return -3;
     }
 
-    smpp_client_conn_t *conn = (smpp_client_conn_t *)malloc(sizeof(smpp_client_conn_t));
-    if (!conn) {
-        close(fd);
-        return NULL;
-    }
-
-    memset(conn, 0, sizeof(smpp_client_conn_t));
-    strncpy(conn->smsc_id, profile->smsc_id, sizeof(conn->smsc_id) - 1);
     conn->sock_fd = fd;
     conn->state = SMPP_STATE_CONNECTED;
-    conn->sequence_number = 1;
-    memcpy(&conn->profile, profile, sizeof(smpp_smsc_profile_t));
 
     /* Send bind_transceiver */
     smpp_pdu_t bind_pdu;
     memset(&bind_pdu, 0, sizeof(bind_pdu));
     smpp_header_init(&bind_pdu.header, SMPP_CMD_BIND_TRANSCEIVER, ESME_ROK, conn->sequence_number++);
 
-    strncpy(bind_pdu.body.bind_req.system_id, profile->system_id, sizeof(bind_pdu.body.bind_req.system_id) - 1);
-    strncpy(bind_pdu.body.bind_req.password, profile->password, sizeof(bind_pdu.body.bind_req.password) - 1);
-    strncpy(bind_pdu.body.bind_req.system_type, profile->system_type, sizeof(bind_pdu.body.bind_req.system_type) - 1);
-    bind_pdu.body.bind_req.interface_version = profile->version ? profile->version : SMPP_VERSION_34;
+    strncpy(bind_pdu.body.bind_req.system_id, conn->profile.system_id, sizeof(bind_pdu.body.bind_req.system_id) - 1);
+    strncpy(bind_pdu.body.bind_req.password, conn->profile.password, sizeof(bind_pdu.body.bind_req.password) - 1);
+    strncpy(bind_pdu.body.bind_req.system_type, conn->profile.system_type, sizeof(bind_pdu.body.bind_req.system_type) - 1);
+    bind_pdu.body.bind_req.interface_version = conn->profile.version ? conn->profile.version : SMPP_VERSION_34;
 
     uint8_t tx_buf[512];
     size_t tx_len = 0;
@@ -196,22 +215,64 @@ smpp_client_conn_t *smpp_client_connect(const smpp_smsc_profile_t *profile)
 
     if (conn->state == SMPP_STATE_BOUND_TRX) {
         conn->running = 1;
+        conn->owner_pid = getpid();
+        conn->last_activity_ms = (uint64_t)time(NULL);
         pthread_create(&conn->rx_thread, NULL, client_rx_thread_func, conn);
+        return 0;
     }
 
+    close(fd);
+    conn->sock_fd = -1;
+    conn->state = SMPP_STATE_DISCONNECTED;
+    return -4;
+}
+
+smpp_client_conn_t *smpp_client_connect(const smpp_smsc_profile_t *profile)
+{
+    if (!profile) return NULL;
+
+    /* Check if already in list */
     pthread_mutex_lock(&client_mutex);
+    smpp_client_conn_t *existing = client_conns;
+    while (existing) {
+        if (strcmp(existing->smsc_id, profile->smsc_id) == 0) {
+            pthread_mutex_unlock(&client_mutex);
+            if (existing->state != SMPP_STATE_BOUND_TRX) {
+                do_client_connect_and_bind(existing);
+            }
+            return existing;
+        }
+        existing = existing->next;
+    }
+
+    smpp_client_conn_t *conn = (smpp_client_conn_t *)malloc(sizeof(smpp_client_conn_t));
+    if (!conn) {
+        pthread_mutex_unlock(&client_mutex);
+        return NULL;
+    }
+
+    memset(conn, 0, sizeof(smpp_client_conn_t));
+    strncpy(conn->smsc_id, profile->smsc_id, sizeof(conn->smsc_id) - 1);
+    conn->sock_fd = -1;
+    conn->state = SMPP_STATE_DISCONNECTED;
+    conn->sequence_number = 1;
+    memcpy(&conn->profile, profile, sizeof(smpp_smsc_profile_t));
+    pthread_mutex_init(&conn->resp_mutex, NULL);
+    pthread_cond_init(&conn->resp_cond, NULL);
+
     conn->next = client_conns;
     client_conns = conn;
     pthread_mutex_unlock(&client_mutex);
 
+    do_client_connect_and_bind(conn);
     return conn;
 }
-
 
 int smpp_client_disconnect(smpp_client_conn_t *conn)
 {
     if (!conn) return -1;
 
+    conn->running = 0;
     if (conn->sock_fd >= 0) {
         if (conn->state == SMPP_STATE_BOUND_TRX) {
             smpp_pdu_t unbind_pdu;
@@ -261,67 +322,61 @@ int smpp_client_send_submit_sm(smpp_client_conn_t *conn, const char *src, const 
     size_t tx_len = 0;
     if (smpp_pdu_pack(&pdu, tx_buf, sizeof(tx_buf), &tx_len) < 0) return -2;
 
-    if (send(conn->sock_fd, tx_buf, tx_len, 0) < 0) return -3;
-
-    if (send(conn->sock_fd, tx_buf, tx_len, 0) < 0) return -3;
-
-    /* Read submit_sm_resp (or handle deliver_sm/enquire_link if interleaved) */
-    int res = -4;
-    while (1) {
-        uint8_t rx_buf[2048];
-        ssize_t rx_len = recv(conn->sock_fd, rx_buf, sizeof(rx_buf), 0);
-        if (rx_len < SMPP_HEADER_LEN) break;
-
-        smpp_pdu_t resp;
-        if (smpp_pdu_unpack(rx_buf, (size_t)rx_len, &resp) < 0) {
-            res = -5;
-            break;
+    /* If called from a forked child process (different PID from rx_thread owner),
+     * pthread cond_wait cannot be signaled across processes without shared memory.
+     * In this case, send the SUBMIT_SM and generate a tracking sequence ID immediately. */
+    if (conn->owner_pid != 0 && conn->owner_pid != getpid()) {
+        if (send(conn->sock_fd, tx_buf, tx_len, 0) < 0) {
+            return -3;
         }
-
-        if (resp.header.command_id == SMPP_CMD_SUBMIT_SM_RESP) {
-            res = (resp.header.command_status == ESME_ROK) ? 0 : (int)resp.header.command_status;
-            if (res == 0 && out_msg_id) {
-                strncpy(out_msg_id, resp.body.msg_resp.message_id, 64);
-                out_msg_id[64] = '\0';
-            }
-            smpp_pdu_free(&resp);
-            break;
-        } else if (resp.header.command_id == SMPP_CMD_DELIVER_SM) {
-            /* Acknowledge deliver_sm immediately */
-            smpp_pdu_t d_resp;
-            memset(&d_resp, 0, sizeof(d_resp));
-            smpp_header_init(&d_resp.header, SMPP_CMD_DELIVER_SM_RESP, ESME_ROK, resp.header.sequence_number);
-            uint8_t d_tx[64];
-            size_t d_tx_len = 0;
-            if (smpp_pdu_pack(&d_resp, d_tx, sizeof(d_tx), &d_tx_len) == 0) {
-                send(conn->sock_fd, d_tx, d_tx_len, 0);
-            }
-
-            pthread_mutex_lock(&client_mutex);
-            smpp_client_deliver_cb_t cb = client_deliver_cb;
-            pthread_mutex_unlock(&client_mutex);
-            if (cb) {
-                cb(conn->smsc_id, &resp.body.msg);
-            }
-            smpp_pdu_free(&resp);
-        } else if (resp.header.command_id == SMPP_CMD_ENQUIRE_LINK) {
-            smpp_pdu_t el_resp;
-            memset(&el_resp, 0, sizeof(el_resp));
-            smpp_make_enquire_link_resp(&el_resp, resp.header.sequence_number);
-            uint8_t el_tx[64];
-            size_t el_tx_len = 0;
-            if (smpp_pdu_pack(&el_resp, el_tx, sizeof(el_tx), &el_tx_len) == 0) {
-                send(conn->sock_fd, el_tx, el_tx_len, 0);
-            }
-            smpp_pdu_free(&resp);
-        } else {
-            smpp_pdu_free(&resp);
+        conn->last_activity_ms = (uint64_t)time(NULL);
+        if (out_msg_id) {
+            snprintf(out_msg_id, 65, "SIP-%u", seq);
         }
+        return 0;
     }
+
+    /* Prepare response waiter (same process where rx_thread runs) */
+    pthread_mutex_lock(&conn->resp_mutex);
+    conn->waiting_seq = seq;
+    conn->resp_received = 0;
+    conn->resp_status = (uint32_t)-1;
+    conn->resp_msg_id[0] = '\0';
+
+    if (send(conn->sock_fd, tx_buf, tx_len, 0) < 0) {
+        conn->waiting_seq = 0;
+        pthread_mutex_unlock(&conn->resp_mutex);
+        return -3;
+    }
+
+    conn->last_activity_ms = (uint64_t)time(NULL);
+
+    /* Wait for SUBMIT_SM_RESP up to 5 seconds */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 5;
+
+    int wait_rc = 0;
+    while (!conn->resp_received && wait_rc == 0) {
+        wait_rc = pthread_cond_timedwait(&conn->resp_cond, &conn->resp_mutex, &ts);
+    }
+
+    int res = -4;
+    if (conn->resp_received) {
+        res = (conn->resp_status == ESME_ROK) ? 0 : (int)conn->resp_status;
+        if (res == 0 && out_msg_id) {
+            strncpy(out_msg_id, conn->resp_msg_id, 64);
+            out_msg_id[64] = '\0';
+        }
+    } else {
+        res = -4; /* Timeout waiting for response */
+    }
+
+    conn->waiting_seq = 0;
+    pthread_mutex_unlock(&conn->resp_mutex);
 
     return res;
 }
-
 
 int smpp_client_send_enquire_link(smpp_client_conn_t *conn)
 {
@@ -335,15 +390,53 @@ int smpp_client_send_enquire_link(smpp_client_conn_t *conn)
     if (smpp_pdu_pack(&pdu, tx_buf, sizeof(tx_buf), &tx_len) < 0) return -2;
 
     if (send(conn->sock_fd, tx_buf, tx_len, 0) < 0) return -3;
+    conn->last_activity_ms = (uint64_t)time(NULL);
+    return 0;
+}
 
-    uint8_t rx_buf[64];
-    ssize_t rx_len = recv(conn->sock_fd, rx_buf, sizeof(rx_buf), 0);
-    if (rx_len < SMPP_HEADER_LEN) return -4;
+static void *supervisor_thread_func(void *arg)
+{
+    (void)arg;
+    while (supervisor_running) {
+        sleep(1);
+        if (!supervisor_running) break;
 
-    smpp_pdu_t resp;
-    if (smpp_pdu_unpack(rx_buf, (size_t)rx_len, &resp) < 0) return -5;
+        uint64_t now = (uint64_t)time(NULL);
 
-    int ok = (resp.header.command_id == SMPP_CMD_ENQUIRE_LINK_RESP && resp.header.command_status == ESME_ROK) ? 0 : -6;
-    smpp_pdu_free(&resp);
-    return ok;
+        pthread_mutex_lock(&client_mutex);
+        smpp_client_conn_t *curr = client_conns;
+        while (curr) {
+            if (curr->state == SMPP_STATE_DISCONNECTED) {
+                if (now - curr->last_activity_ms >= (uint64_t)supervisor_reconnect_interval) {
+                    curr->last_activity_ms = now;
+                    pthread_mutex_unlock(&client_mutex);
+                    do_client_connect_and_bind(curr);
+                    pthread_mutex_lock(&client_mutex);
+                }
+            } else if (curr->state == SMPP_STATE_BOUND_TRX) {
+                if (now - curr->last_activity_ms >= (uint64_t)supervisor_enquire_interval) {
+                    smpp_client_send_enquire_link(curr);
+                }
+            }
+            curr = curr->next;
+        }
+        pthread_mutex_unlock(&client_mutex);
+    }
+    return NULL;
+}
+
+int smpp_client_start_supervisor(int reconnect_sec, int enquire_sec)
+{
+    if (supervisor_running) return 0;
+    if (reconnect_sec > 0) supervisor_reconnect_interval = reconnect_sec;
+    if (enquire_sec > 0) supervisor_enquire_interval = enquire_sec;
+    supervisor_running = 1;
+    return pthread_create(&supervisor_thread, NULL, supervisor_thread_func, NULL);
+}
+
+void smpp_client_stop_supervisor(void)
+{
+    if (!supervisor_running) return;
+    supervisor_running = 0;
+    pthread_join(supervisor_thread, NULL);
 }

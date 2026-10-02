@@ -107,6 +107,31 @@ static void make_http_response(int code, const char *status_text, const char *js
     }
 }
 
+static int json_extract_string(const char *json, const char *key, char *out, size_t max_out)
+{
+    if (!json || !key || !out || max_out == 0) return -1;
+    char search_pattern[64];
+    snprintf(search_pattern, sizeof(search_pattern), "\"%s\"", key);
+    const char *p = strstr(json, search_pattern);
+    if (!p) return -1;
+    p += strlen(search_pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return -1;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') return -1;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i < max_out - 1) {
+        if (*p == '\\' && *(p + 1)) {
+            p++;
+        }
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return 0;
+}
+
 int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp_buf, size_t max_resp, size_t *out_len)
 {
     (void)req_len;
@@ -171,17 +196,22 @@ int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp
         char smsc_target[32] = "sim1";
 
         if (body_start) {
-            char *p_to = strstr(body_start, "\"to\":");
-            if (p_to) sscanf(p_to, "\"to\":\"%31[^\"]\"", to_num);
+            if (json_extract_string(body_start, "to", to_num, sizeof(to_num)) != 0 &&
+                json_extract_string(body_start, "dst", to_num, sizeof(to_num)) != 0) {
+                json_extract_string(body_start, "destination", to_num, sizeof(to_num));
+            }
 
-            char *p_from = strstr(body_start, "\"from\":");
-            if (p_from) sscanf(p_from, "\"from\":\"%31[^\"]\"", from_num);
+            if (json_extract_string(body_start, "from", from_num, sizeof(from_num)) != 0 &&
+                json_extract_string(body_start, "src", from_num, sizeof(from_num)) != 0) {
+                json_extract_string(body_start, "source", from_num, sizeof(from_num));
+            }
 
-            char *p_text = strstr(body_start, "\"text\":");
-            if (p_text) sscanf(p_text, "\"text\":\"%255[^\"]\"", text_str);
+            if (json_extract_string(body_start, "text", text_str, sizeof(text_str)) != 0 &&
+                json_extract_string(body_start, "message", text_str, sizeof(text_str)) != 0) {
+                json_extract_string(body_start, "body", text_str, sizeof(text_str));
+            }
 
-            char *p_smsc = strstr(body_start, "\"smsc\":");
-            if (p_smsc) sscanf(p_smsc, "\"smsc\":\"%31[^\"]\"", smsc_target);
+            json_extract_string(body_start, "smsc", smsc_target, sizeof(smsc_target));
         }
 
         if (!to_num[0] || !text_str[0]) {

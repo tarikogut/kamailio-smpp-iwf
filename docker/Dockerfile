@@ -18,9 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /usr/src/kamailio
 COPY . /usr/src/kamailio
 
-RUN make cfg && \
-    make -j$(nproc) all modules=modules/smpp modules/sl modules/tm modules/pv modules/maxfwd modules/textops modules/xlog modules/rr modules/siputils modules/kex modules/corex && \
-    make install-bin install-modules modules=modules/smpp modules/sl modules/tm modules/pv modules/maxfwd modules/textops modules/xlog modules/rr modules/siputils modules/kex modules/corex install-cfg
+RUN make proper 2>/dev/null || true && \
+    make cfg && \
+    make -j$(nproc) all modules="modules/smpp modules/sl modules/tm modules/pv modules/maxfwd modules/textops modules/xlog modules/rr modules/siputils modules/kex modules/corex" && \
+    make install-bin install-modules modules="modules/smpp modules/sl modules/tm modules/pv modules/maxfwd modules/textops modules/xlog modules/rr modules/siputils modules/kex modules/corex" install-cfg
 
 EXPOSE 5060/udp 5060/tcp 2779/tcp
 

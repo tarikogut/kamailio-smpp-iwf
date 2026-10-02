@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include "smpp_pdu.h"
 #include "smpp_config.h"
 
@@ -32,6 +34,13 @@ typedef struct smpp_client_conn {
     smpp_smsc_profile_t profile;
     pthread_t rx_thread;
     volatile int running;
+    pthread_mutex_t resp_mutex;
+    pthread_cond_t resp_cond;
+    uint32_t waiting_seq;
+    int resp_received;
+    uint32_t resp_status;
+    char resp_msg_id[65];
+    pid_t owner_pid;
     struct smpp_client_conn *next;
 } smpp_client_conn_t;
 
@@ -41,6 +50,9 @@ void smpp_client_set_deliver_cb(smpp_client_deliver_cb_t cb);
 
 int smpp_client_init(void);
 void smpp_client_destroy(void);
+
+int smpp_client_start_supervisor(int reconnect_sec, int enquire_sec);
+void smpp_client_stop_supervisor(void);
 
 smpp_client_conn_t *smpp_client_connect(const smpp_smsc_profile_t *profile);
 int smpp_client_disconnect(smpp_client_conn_t *conn);

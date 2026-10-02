@@ -192,17 +192,59 @@ function ksr_request_route()
 end
 ```
 
-### 7. İstemci Testi
+### 7. İstemci & Uçtan Uca Çoklu Protokol Testleri
+
+#### A. SMPP İstemci ile SMS Gönderme ve Anlık DLR Alma Testi
 Kamailio SMS-IWF varsayılan olarak `2779` portunda dinler:
 ```bash
-python3 examples/test_client.py
+python3 examples/test_client.py 2779
 ```
-**Bağlantı Bilgileri:**
-- **Host:** `127.0.0.1`
-- **Port:** `2779`
-- **System ID:** `kamailio_client`
-- **Password:** `kamailio_pass`
-- **SMPP Versiyonu:** `v3.4` (0x34)
+**Akış:**
+`ESME BIND (2779)` ➔ `SUBMIT_SM` ➔ `Kamailio SMS-IWF (sim1 / 2775)` ➔ `SUBMIT_SM_RESP (MsgID)` ➔ Operatör Teslimatı ➔ `DELIVER_SM (DLR, stat:DELIVRD)` ➔ `DELIVER_SM_RESP ACK`
+
+#### B. SIP'ten SMPP'ye SMS Gönderme (SIP-to-SMPP Gateway)
+Kamailio SIP UDP 5060 portuna `MESSAGE` gönderildiğinde mesaj operatör SMPP bağlantısına iletilir ve SIP istemcisine `200 OK` dönülür:
+```bash
+python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('0.0.0.0', 5071))
+s.settimeout(3.0)
+msg = (
+    'MESSAGE sip:905321112233@127.0.0.1:5060 SIP/2.0\r\n'
+    'Via: SIP/2.0/UDP 127.0.0.1:5071;branch=z9hG4bK889qwe;rport\r\n'
+    'Max-Forwards: 70\r\n'
+    'From: <sip:905329998877@127.0.0.1:5071>;tag=991122\r\n'
+    'To: <sip:905321112233@127.0.0.1:5060>\r\n'
+    'Call-ID: sip-msg-01@127.0.0.1\r\n'
+    'CSeq: 1 MESSAGE\r\n'
+    'Content-Type: text/plain\r\n'
+    'Content-Length: 26\r\n\r\n'
+    'SIP to SMPP interwork test'
+)
+s.sendto(msg.encode('utf-8'), ('127.0.0.1', 5060))
+data, addr = s.recvfrom(4096)
+print(data.decode('utf-8'))
+"
+```
+**Sonuç:** `SIP/2.0 200 OK (Forwarded to SMPP)`
+
+#### C. HTTP REST API'den SMPP'ye SMS Gönderme ve DLR Takibi (HTTP-to-SMPP)
+```bash
+# 1. SMS Gönder (POST)
+curl -X POST http://127.0.0.1:8080/api/v1/sms/send \
+  -H "Authorization: Bearer secret-token-123" \
+  -H "Content-Type: application/json" \
+  -d '{"smsc":"sim1","src":"API_CLIENT","dst":"905321112233","text":"Test Mesaji"}'
+
+# Dönen Yanıt: {"status":"accepted","message_id":"0be72574...","smsc":"sim1","to":"905321112233"}
+
+# 2. Teslimat Raporunu Sorgula (GET)
+curl "http://127.0.0.1:8080/api/v1/sms/query?id=0be72574..." \
+  -H "Authorization: Bearer secret-token-123"
+
+# Dönen Yanıt: {"message_id":"0be72574...","status":"DELIVRD","smsc":"sim1",...}
+```
 
 ---
 
@@ -399,6 +441,7 @@ modparam("smpp", "listen_ip", "0.0.0.0")
 modparam("smpp", "listen_port", 2779)
 modparam("smpp", "default_client_mps", 50)
 modparam("smpp", "enquire_link_interval", 30)
+modparam("smpp", "reconnect_interval", 10)
 modparam("smpp", "msgid_format", "%PREFIX%-%TIMESTAMP%-%HEXSEQ%")
 modparam("smpp", "http_api_enable", 1)
 modparam("smpp", "http_api_port", 8080)
@@ -408,7 +451,7 @@ request_route {
     if (is_method("MESSAGE")) {
         # Bridge SIP MESSAGE to SMPP SMSC
         smpp_send("sim1", "$fU", "$rU", "$rb");
-        sl_send_reply("200", "SMS Accepted by SMS-IWF");
+        sl_send_reply("200", "OK (Forwarded to SMPP)");
         exit;
     }
 }
@@ -417,13 +460,11 @@ request_route {
 ### 8. Running the Unit & Verification Test Suite
 
 ```bash
-clang -Wall -Wextra -O2 \
-  smpp_tlv.c smpp_pdu.c smpp_nli.c smpp_manip.c \
-  smpp_ratelimit.c smpp_config.c smpp_client.c \
-  smpp_server.c smpp_interwork.c smpp_dlr.c smpp_mnp.c smpp_http_api.c \
-  test_smpp.c -o test_smpp && ./test_smpp
+gcc -Wall -O2 test_smpp.c smpp_pdu.c smpp_tlv.c smpp_manip.c smpp_ratelimit.c \
+  smpp_nli.c smpp_interwork.c smpp_dlr.c smpp_config.c smpp_client.c \
+  smpp_server.c smpp_mnp.c smpp_http_api.c -lpthread -o test_smpp && ./test_smpp
 ```
-Result: **13 Test Suites, 98 Tests Passed, 0 Failures.**
+Result: **13 Test Suites, 113 Tests Passed, 0 Failures.**
 
 
 ---
