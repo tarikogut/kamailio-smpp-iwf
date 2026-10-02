@@ -178,3 +178,62 @@ int smpp_manip_normalize_msisdn(const char *in_num, char *out_e164, size_t max_l
 
     return 0;
 }
+
+void smpp_detect_ton_npi(const char *addr, uint8_t *ton, uint8_t *npi)
+{
+    uint8_t det_ton = SMPP_TON_UNKNOWN;
+    uint8_t det_npi = SMPP_NPI_ISDN;
+
+    if (!addr || *addr == '\0') {
+        if (ton) *ton = SMPP_TON_UNKNOWN;
+        if (npi) *npi = SMPP_NPI_ISDN;
+        return;
+    }
+
+    const char *p = addr;
+    int has_plus = 0;
+    if (*p == '+') {
+        has_plus = 1;
+        p++;
+    }
+
+    /* Check if the rest of characters are numeric */
+    int is_numeric = 1;
+    size_t digits_len = 0;
+    for (const char *c = p; *c != '\0'; c++) {
+        if (!isdigit((unsigned char)*c)) {
+            is_numeric = 0;
+            break;
+        }
+        digits_len++;
+    }
+
+    if (!is_numeric || digits_len == 0) {
+        /* Contains non-digits (letters or special chars): Alphanumeric */
+        det_ton = SMPP_TON_ALPHANUMERIC;
+        det_npi = SMPP_NPI_UNKNOWN;
+    } else if (has_plus) {
+        /* Explicit leading '+' followed by digits -> International E.164 */
+        det_ton = SMPP_TON_INTERNATIONAL;
+        det_npi = SMPP_NPI_ISDN;
+    } else if (digits_len <= 5) {
+        /* Numeric and length <= 5: Shortcode / Abbreviated */
+        det_ton = SMPP_TON_ABBREVIATED;
+        det_npi = SMPP_NPI_UNKNOWN;
+    } else if (p[0] == '0') {
+        /* Numeric and starts with '0': National (e.g., 0532...) */
+        det_ton = SMPP_TON_NATIONAL;
+        det_npi = SMPP_NPI_ISDN;
+    } else if (digits_len >= 7 && digits_len <= 15) {
+        /* Standard International E.164 (e.g., 90532...) */
+        det_ton = SMPP_TON_INTERNATIONAL;
+        det_npi = SMPP_NPI_ISDN;
+    } else {
+        /* Otherwise */
+        det_ton = SMPP_TON_UNKNOWN;
+        det_npi = SMPP_NPI_ISDN;
+    }
+
+    if (ton) *ton = det_ton;
+    if (npi) *npi = det_npi;
+}

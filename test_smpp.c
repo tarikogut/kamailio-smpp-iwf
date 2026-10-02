@@ -20,6 +20,7 @@
 #include "smpp_server.h"
 #include "smpp_interwork.h"
 #include "smpp_http_api.h"
+#include "smpp_concat.h"
 
 char *smpp_msgid_format = "%PREFIX%-%TIMESTAMP%-%HEXSEQ%";
 int smpp_http_api_enable = 1;
@@ -611,13 +612,405 @@ static void test_rest_api_suite(void)
 
     /* 12. Test Delete User: DELETE /api/v1/users?id=esme_api_user */
     const char *req_del_user = 
-        "DELETE /api/v1/users?id=esme_api_user HTTP/1.1\r\n"
+        "DELETE /api/v1/users?id=esme_api_user HTTP/1.1\n"
         "Host: localhost:8080\r\n"
         "Authorization: Bearer secret-token-123\r\n"
         "\r\n";
     rc = smpp_http_api_handle_request(req_del_user, strlen(req_del_user), resp_buf, sizeof(resp_buf), &resp_len);
     TEST_ASSERT(rc == 0, "DELETE /api/v1/users handled");
     TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "User delete returns 200 OK");
+}
+
+/* 14. Test Dynamic & Configurable TON / NPI */
+static void test_dynamic_ton_npi(void)
+{
+    printf("\n=== Running Test Suite 14: Dynamic & Configurable TON and NPI ===\n");
+
+    uint8_t ton = 0xFF, npi = 0xFF;
+
+    /* 1. Alphanumeric detection (contains letters/non-digits) */
+    smpp_detect_ton_npi("MYBRAND", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_ALPHANUMERIC && npi == SMPP_NPI_UNKNOWN,
+                "Alphanumeric address 'MYBRAND' -> TON=5 (Alphanumeric), NPI=0 (Unknown)");
+
+    smpp_detect_ton_npi("INFO-SMS", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_ALPHANUMERIC && npi == SMPP_NPI_UNKNOWN,
+                "Alphanumeric address 'INFO-SMS' -> TON=5 (Alphanumeric), NPI=0 (Unknown)");
+
+    /* 2. Shortcode / Abbreviated detection (numeric, length <= 5) */
+    smpp_detect_ton_npi("1234", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_ABBREVIATED && npi == SMPP_NPI_UNKNOWN,
+                "Shortcode '1234' -> TON=6 (Abbreviated), NPI=0 (Unknown)");
+
+    smpp_detect_ton_npi("32500", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_ABBREVIATED && npi == SMPP_NPI_UNKNOWN,
+                "Shortcode '32500' -> TON=6 (Abbreviated), NPI=0 (Unknown)");
+
+    /* 3. National number detection (numeric, starts with '0') */
+    smpp_detect_ton_npi("05321234567", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_NATIONAL && npi == SMPP_NPI_ISDN,
+                "National number '05321234567' -> TON=2 (National), NPI=1 (ISDN)");
+
+    smpp_detect_ton_npi("02123456789", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_NATIONAL && npi == SMPP_NPI_ISDN,
+                "National landline '02123456789' -> TON=2 (National), NPI=1 (ISDN)");
+
+    /* 4. International number detection (numeric 7-15 digits, or with leading '+') */
+    smpp_detect_ton_npi("905321234567", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_INTERNATIONAL && npi == SMPP_NPI_ISDN,
+                "International number '905321234567' -> TON=1 (International), NPI=1 (ISDN)");
+
+    smpp_detect_ton_npi("+905321234567", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_INTERNATIONAL && npi == SMPP_NPI_ISDN,
+                "International number '+905321234567' -> TON=1 (International), NPI=1 (ISDN)");
+
+    smpp_detect_ton_npi("+14155552671", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_INTERNATIONAL && npi == SMPP_NPI_ISDN,
+                "International number '+14155552671' -> TON=1 (International), NPI=1 (ISDN)");
+
+    /* 5. Fallback detection */
+    smpp_detect_ton_npi("", &ton, &npi);
+    TEST_ASSERT(ton == SMPP_TON_UNKNOWN && npi == SMPP_NPI_ISDN,
+                "Empty address '' -> TON=0 (Unknown), NPI=1 (ISDN)");
+
+    /* 6. Interworking: http_json_to_smpp auto-detection */
+    smpp_msg_t jmsg;
+    const char *json_in = "{\"from\":\"TURKCELL\",\"to\":\"05321234567\",\"text\":\"Dynamic TON test\"}";
+    int rc = http_json_to_smpp(json_in, &jmsg);
+    TEST_ASSERT(rc == 0, "http_json_to_smpp parsed successfully");
+    TEST_ASSERT(jmsg.source_addr_ton == SMPP_TON_ALPHANUMERIC && jmsg.source_addr_npi == SMPP_NPI_UNKNOWN,
+                "http_json_to_smpp source 'TURKCELL' auto-detected as TON=5, NPI=0");
+    TEST_ASSERT(jmsg.dest_addr_ton == SMPP_TON_NATIONAL && jmsg.dest_addr_npi == SMPP_NPI_ISDN,
+                "http_json_to_smpp destination '05321234567' auto-detected as TON=2, NPI=1");
+
+    /* 7. HTTP API POST /api/v1/sms/send with explicit integer TON/NPI */
+    const char *api_payload = 
+        "{\"smsc\":\"sim1\",\"from\":\"8888\",\"to\":\"905321112233\",\"text\":\"Explicit TON Test\","
+        "\"src_ton\":6,\"src_npi\":0,\"dst_ton\":1,\"dst_npi\":1}";
+    char req_buf[1024];
+    snprintf(req_buf, sizeof(req_buf),
+        "POST /api/v1/sms/send HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n%s", strlen(api_payload), api_payload);
+
+    char resp_buf[2048];
+    size_t resp_len = 0;
+    rc = smpp_http_api_handle_request(req_buf, strlen(req_buf), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "HTTP API send with explicit integer TON/NPI handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "HTTP API returns 200 OK");
+    TEST_ASSERT(strstr(resp_buf, "\"status\":\"accepted\"") != NULL, "SMS accepted with explicit TON/NPI");
+
+    /* 8. HTTP API POST /api/v1/sms/send with string TON/NPI */
+    const char *api_payload_str = 
+        "{\"smsc\":\"sim1\",\"from\":\"MYBRAND\",\"to\":\"05321112233\",\"text\":\"String TON Test\","
+        "\"src_ton\":\"5\",\"src_npi\":\"0\",\"dst_ton\":\"2\",\"dst_npi\":\"1\"}";
+    snprintf(req_buf, sizeof(req_buf),
+        "POST /api/v1/sms/send HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n%s", strlen(api_payload_str), api_payload_str);
+
+    rc = smpp_http_api_handle_request(req_buf, strlen(req_buf), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "HTTP API send with string formatted TON/NPI handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "HTTP API returns 200 OK with string TON/NPI");
+
+    /* 9. Test smpp_client_send_submit_sm_ex auto-detection fallback (when 0xFF passed) */
+    /* Create a simulated connection in BOUND_TRX state for packaging verification */
+    smpp_client_conn_t sim_conn;
+    memset(&sim_conn, 0, sizeof(sim_conn));
+    strcpy(sim_conn.smsc_id, "sim_test");
+    sim_conn.state = SMPP_STATE_BOUND_TRX;
+    sim_conn.sock_fd = 9999; /* Non-existent socket descriptor so send() fails with -3 */
+    pthread_mutex_init(&sim_conn.resp_mutex, NULL);
+    pthread_cond_init(&sim_conn.resp_cond, NULL);
+    char out_mid[65] = {0};
+    /* Calling with invalid sock_fd returns -3 (send failed), proving it passed parameter validation and TON auto-detect */
+    rc = smpp_client_send_submit_sm_ex(&sim_conn, "SHORT", "05321234567", 0xFF, 0xFF, 0xFF, 0xFF,
+                                       (const uint8_t *)"Hello", 5, 0, 0, NULL, out_mid);
+    TEST_ASSERT(rc == -3, "smpp_client_send_submit_sm_ex auto-detects and attempts send (returns -3 on test fd)");
+
+    /* Explicit TON/NPI override */
+    rc = smpp_client_send_submit_sm_ex(&sim_conn, "12345", "905321234567", 6, 0, 1, 1,
+                                       (const uint8_t *)"Hello", 5, 0, 0, NULL, out_mid);
+    TEST_ASSERT(rc == -3, "smpp_client_send_submit_sm_ex accepts explicit TON/NPI parameters");
+
+    pthread_mutex_destroy(&sim_conn.resp_mutex);
+    pthread_cond_destroy(&sim_conn.resp_cond);
+}
+
+/* Global capture for server deliver callback in test */
+static int test_server_deliver_called = 0;
+static char test_server_deliver_body[2048] = {0};
+
+static int on_test_server_deliver(smpp_server_session_t *sess, const smpp_msg_t *msg)
+{
+    (void)sess;
+    test_server_deliver_called = 1;
+    if (msg) {
+        size_t l = msg->sm_length < sizeof(test_server_deliver_body) - 1 ? msg->sm_length : sizeof(test_server_deliver_body) - 1;
+        memcpy(test_server_deliver_body, msg->short_message, l);
+        test_server_deliver_body[l] = '\0';
+    }
+    return 0;
+}
+
+/* 15. Test Multipart / Concatenated SMS (SAR & UDH) Segmentation and Reassembly */
+static void test_multipart_segmentation_reassembly(void)
+{
+    printf("\n=== Running Test Suite 15: Multipart / Concatenated SMS (SAR & UDH) ===\n");
+
+    /* 1. Single SMS limit (GSM <= 160 characters) */
+    const char *short_gsm = "This is a short single GSM message that fits easily within standard 160 chars.";
+    smpp_msg_t segs_single[8];
+    int n = smpp_split_message((const uint8_t *)short_gsm, strlen(short_gsm), SMPP_ENCODING_DEFAULT, 1, 10, segs_single, 8);
+    TEST_ASSERT(n == 1, "smpp_split_message returns 1 segment for message <= 160 GSM chars");
+    TEST_ASSERT(segs_single[0].esm_class == 0, "Single GSM segment does not set UDHI");
+    TEST_ASSERT(segs_single[0].sm_length == strlen(short_gsm), "Single GSM segment length matches input");
+    TEST_ASSERT(memcmp(segs_single[0].short_message, short_gsm, strlen(short_gsm)) == 0, "Single GSM segment payload matches");
+
+    /* 2. Single SMS limit (UCS-2 <= 70 characters / 140 bytes) */
+    uint8_t ucs2_short[140];
+    for (int i = 0; i < 140; i++) ucs2_short[i] = (uint8_t)(i & 0xFF);
+    n = smpp_split_message(ucs2_short, 140, SMPP_ENCODING_UCS2, 1, 11, segs_single, 8);
+    TEST_ASSERT(n == 1, "smpp_split_message returns 1 segment for message <= 70 UCS-2 chars (140 bytes)");
+    TEST_ASSERT(segs_single[0].esm_class == 0, "Single UCS-2 segment does not set UDHI");
+    TEST_ASSERT(segs_single[0].sm_length == 140, "Single UCS-2 segment length matches input");
+
+    /* 3. GSM 7-bit UDH segmentation (> 160 chars) */
+    char gsm_long[321];
+    for (int i = 0; i < 320; i++) gsm_long[i] = 'A' + (i % 26);
+    gsm_long[320] = '\0';
+
+    smpp_msg_t gsm_segs[8];
+    n = smpp_split_message((const uint8_t *)gsm_long, 320, SMPP_ENCODING_DEFAULT, 1, 0x4A, gsm_segs, 8);
+    TEST_ASSERT(n == 3, "320-char GSM message split into 3 segments (153 + 153 + 14)");
+
+    /* Segment 1: UDH header + 153 chars = 159 bytes */
+    TEST_ASSERT(gsm_segs[0].esm_class == 0x40, "Segment 1 has UDHI bit (0x40) set");
+    TEST_ASSERT(gsm_segs[0].sm_length == 159, "Segment 1 sm_length is 159 (6 UDH + 153 payload)");
+    TEST_ASSERT(gsm_segs[0].short_message[0] == 0x05, "UDHL is 0x05");
+    TEST_ASSERT(gsm_segs[0].short_message[1] == 0x00, "IEI is 0x00 (Concatenated 8-bit ref)");
+    TEST_ASSERT(gsm_segs[0].short_message[2] == 0x03, "IEDL is 0x03");
+    TEST_ASSERT(gsm_segs[0].short_message[3] == 0x4A, "Ref num is 0x4A");
+    TEST_ASSERT(gsm_segs[0].short_message[4] == 3, "Total segments is 3");
+    TEST_ASSERT(gsm_segs[0].short_message[5] == 1, "Sequence number is 1");
+    TEST_ASSERT(memcmp(&gsm_segs[0].short_message[6], gsm_long, 153) == 0, "Segment 1 payload matches slice");
+
+    /* Segment 2: UDH header + 153 chars = 159 bytes */
+    TEST_ASSERT(gsm_segs[1].esm_class == 0x40, "Segment 2 has UDHI bit set");
+    TEST_ASSERT(gsm_segs[1].sm_length == 159, "Segment 2 sm_length is 159");
+    TEST_ASSERT(gsm_segs[1].short_message[5] == 2, "Segment 2 sequence number is 2");
+    TEST_ASSERT(memcmp(&gsm_segs[1].short_message[6], gsm_long + 153, 153) == 0, "Segment 2 payload matches slice");
+
+    /* Segment 3: UDH header + 14 chars = 20 bytes */
+    TEST_ASSERT(gsm_segs[2].esm_class == 0x40, "Segment 3 has UDHI bit set");
+    TEST_ASSERT(gsm_segs[2].sm_length == 20, "Segment 3 sm_length is 20 (6 UDH + 14 payload)");
+    TEST_ASSERT(gsm_segs[2].short_message[5] == 3, "Segment 3 sequence number is 3");
+    TEST_ASSERT(memcmp(&gsm_segs[2].short_message[6], gsm_long + 306, 14) == 0, "Segment 3 payload matches slice");
+
+    /* 4. UCS-2 UDH segmentation (> 70 chars / 140 bytes) */
+    uint8_t ucs2_long[200];
+    for (int i = 0; i < 200; i++) ucs2_long[i] = (uint8_t)(i & 0xFF);
+
+    smpp_msg_t ucs2_segs[8];
+    n = smpp_split_message(ucs2_long, 200, SMPP_ENCODING_UCS2, 1, 0x99, ucs2_segs, 8);
+    TEST_ASSERT(n == 2, "200-byte UCS-2 message split into 2 segments (134 + 66)");
+    TEST_ASSERT(ucs2_segs[0].esm_class == 0x40, "UCS-2 Segment 1 has UDHI bit set");
+    TEST_ASSERT(ucs2_segs[0].sm_length == 140, "UCS-2 Segment 1 sm_length is 140 (6 UDH + 134 payload)");
+    TEST_ASSERT(ucs2_segs[0].short_message[4] == 2, "UCS-2 Segment 1 total is 2");
+    TEST_ASSERT(ucs2_segs[0].short_message[5] == 1, "UCS-2 Segment 1 seq is 1");
+    TEST_ASSERT(ucs2_segs[1].sm_length == 72, "UCS-2 Segment 2 sm_length is 72 (6 UDH + 66 payload)");
+    TEST_ASSERT(ucs2_segs[1].short_message[5] == 2, "UCS-2 Segment 2 seq is 2");
+
+    /* 5. SAR TLV segmentation (> 254 bytes) */
+    uint8_t sar_long[600];
+    for (int i = 0; i < 600; i++) sar_long[i] = (uint8_t)(i % 251);
+
+    smpp_msg_t sar_segs[8];
+    n = smpp_split_message(sar_long, 600, SMPP_ENCODING_DEFAULT, 0, 0x1234, sar_segs, 8);
+    TEST_ASSERT(n == 3, "600-byte message split into 3 SAR segments (254 + 254 + 92)");
+    TEST_ASSERT(sar_segs[0].esm_class == 0x00, "SAR Segment 1 does NOT set UDHI in esm_class");
+    TEST_ASSERT(sar_segs[0].sm_length == 254, "SAR Segment 1 sm_length is 254");
+    TEST_ASSERT(sar_segs[1].sm_length == 254, "SAR Segment 2 sm_length is 254");
+    TEST_ASSERT(sar_segs[2].sm_length == 92, "SAR Segment 3 sm_length is 92");
+
+    /* Verify TLVs in SAR Segment 1 */
+    smpp_tlv_t *t_ref = smpp_tlv_find(sar_segs[0].tlvs, SMPP_TLV_SAR_MSG_REF_NUM);
+    smpp_tlv_t *t_tot = smpp_tlv_find(sar_segs[0].tlvs, SMPP_TLV_SAR_TOTAL_SEGMENTS);
+    smpp_tlv_t *t_seq = smpp_tlv_find(sar_segs[0].tlvs, SMPP_TLV_SAR_SEGMENT_SEQNUM);
+    TEST_ASSERT(t_ref != NULL && t_ref->length == 2, "SAR_MSG_REF_NUM attached with length 2");
+    TEST_ASSERT(t_tot != NULL && t_tot->value[0] == 3, "SAR_TOTAL_SEGMENTS attached with value 3");
+    TEST_ASSERT(t_seq != NULL && t_seq->value[0] == 1, "SAR_SEGMENT_SEQNUM attached with value 1");
+
+    /* 6. Message Concatenation Detection & Metadata Extraction */
+    TEST_ASSERT(smpp_msg_is_concat(&gsm_segs[0]) == 1, "smpp_msg_is_concat detects UDH (returns 1)");
+    TEST_ASSERT(smpp_msg_is_concat(&sar_segs[0]) == 2, "smpp_msg_is_concat detects SAR TLV (returns 2)");
+    TEST_ASSERT(smpp_msg_is_concat(&segs_single[0]) == 0, "smpp_msg_is_concat returns 0 for non-concatenated message");
+
+    uint16_t ex_ref = 0;
+    uint8_t ex_tot = 0, ex_seq = 0;
+    const uint8_t *ex_payload = NULL;
+    size_t ex_plen = 0;
+    int det_rc = smpp_msg_get_concat_info(&gsm_segs[0], &ex_ref, &ex_tot, &ex_seq, &ex_payload, &ex_plen);
+    TEST_ASSERT(det_rc == 1, "smpp_msg_get_concat_info succeeds on UDH segment");
+    TEST_ASSERT(ex_ref == 0x4A && ex_tot == 3 && ex_seq == 1, "Extracted UDH metadata matches (ref=0x4A, tot=3, seq=1)");
+    TEST_ASSERT(ex_plen == 153, "Extracted UDH payload length is 153");
+
+    det_rc = smpp_msg_get_concat_info(&sar_segs[1], &ex_ref, &ex_tot, &ex_seq, &ex_payload, &ex_plen);
+    TEST_ASSERT(det_rc == 2, "smpp_msg_get_concat_info succeeds on SAR segment");
+    TEST_ASSERT(ex_ref == 0x1234 && ex_tot == 3 && ex_seq == 2, "Extracted SAR metadata matches (ref=0x1234, tot=3, seq=2)");
+    TEST_ASSERT(ex_plen == 254, "Extracted SAR payload length is 254");
+
+    /* 7. In-Memory Segment Reassembly (In-Order) */
+    smpp_reassembly_init(60);
+    uint8_t assembled_buf[2048];
+    size_t assembled_len = 0;
+
+    /* Feed Segment 1 of 3 (UDH payload) */
+    int r_rc = smpp_reassembly_add_part(0x4A, 3, 1, &gsm_segs[0].short_message[6], 153, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 0, "Segment 1/3 buffered, reassembly pending (returns 0)");
+
+    /* Feed Segment 2 of 3 */
+    r_rc = smpp_reassembly_add_part(0x4A, 3, 2, &gsm_segs[1].short_message[6], 153, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 0, "Segment 2/3 buffered, reassembly pending (returns 0)");
+
+    /* Feed Segment 3 of 3 */
+    r_rc = smpp_reassembly_add_part(0x4A, 3, 3, &gsm_segs[2].short_message[6], 14, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 1, "Segment 3/3 triggers reassembly completion (returns 1)");
+    TEST_ASSERT(assembled_len == 320, "Reassembled length matches original 320 characters");
+    TEST_ASSERT(memcmp(assembled_buf, gsm_long, 320) == 0, "Reassembled payload matches original full message");
+
+    /* 8. In-Memory Segment Reassembly (Out-Of-Order) */
+    memset(assembled_buf, 0, sizeof(assembled_buf));
+    assembled_len = 0;
+
+    /* Feed Segment 2 first (out of 2) */
+    r_rc = smpp_reassembly_add_part(0x77, 2, 2, (const uint8_t *)"WORLD!", 6, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 0, "Out-of-order part 2/2 buffered (returns 0)");
+
+    /* Feed Segment 1 second */
+    r_rc = smpp_reassembly_add_part(0x77, 2, 1, (const uint8_t *)"HELLO ", 6, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 1, "Out-of-order part 1/2 triggers completion (returns 1)");
+    TEST_ASSERT(assembled_len == 12, "Reassembled out-of-order length is 12");
+    TEST_ASSERT(memcmp(assembled_buf, "HELLO WORLD!", 12) == 0, "Reassembled payload correctly ordered: 'HELLO WORLD!'");
+
+    /* 9. Duplicate Segment Handling */
+    r_rc = smpp_reassembly_add_part(0x88, 2, 1, (const uint8_t *)"PART1", 5, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 0, "First delivery of part 1 buffered (returns 0)");
+    r_rc = smpp_reassembly_add_part(0x88, 2, 1, (const uint8_t *)"PART1", 5, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 0, "Duplicate delivery of part 1 handled idempotently (returns 0)");
+    r_rc = smpp_reassembly_add_part(0x88, 2, 2, (const uint8_t *)"PART2", 5, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 1, "Part 2 completes reassembly after duplicate (returns 1)");
+    TEST_ASSERT(assembled_len == 10 && memcmp(assembled_buf, "PART1PART2", 10) == 0, "Payload assembled without corruption");
+
+    /* 10. End-to-End PDU Reassembly: smpp_reassemble_msg with SAR TLVs */
+    memset(assembled_buf, 0, sizeof(assembled_buf));
+    assembled_len = 0;
+
+    r_rc = smpp_reassemble_msg(&sar_segs[0], assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 0, "smpp_reassemble_msg on SAR seg 1/3 pending (returns 0)");
+    r_rc = smpp_reassemble_msg(&sar_segs[1], assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 0, "smpp_reassemble_msg on SAR seg 2/3 pending (returns 0)");
+    r_rc = smpp_reassemble_msg(&sar_segs[2], assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 1, "smpp_reassemble_msg on SAR seg 3/3 complete (returns 1)");
+    TEST_ASSERT(assembled_len == 600, "smpp_reassemble_msg output length matches 600 bytes");
+    TEST_ASSERT(memcmp(assembled_buf, sar_long, 600) == 0, "smpp_reassemble_msg output matches full 600-byte payload");
+
+    /* 11. TTL Expiration */
+    smpp_reassembly_ctx_t *ttl_ctx = smpp_reassembly_ctx_create(1); /* 1 second TTL */
+    TEST_ASSERT(ttl_ctx != NULL, "smpp_reassembly_ctx_create with 1s TTL succeeds");
+    r_rc = smpp_reassembly_ctx_add_part(ttl_ctx, 0x9999, 2, 1, (const uint8_t *)"TEMP", 4, assembled_buf, sizeof(assembled_buf), &assembled_len);
+    TEST_ASSERT(r_rc == 0, "Part 1 of expiring message buffered");
+    TEST_ASSERT(ttl_ctx->entries != NULL, "Entry is currently present in context");
+    sleep(2); /* Wait past TTL */
+    smpp_reassembly_ctx_cleanup(ttl_ctx);
+    TEST_ASSERT(ttl_ctx->entries == NULL, "Expired segment pruned after TTL expiration");
+    smpp_reassembly_ctx_destroy(ttl_ctx);
+
+    /* 12. Server Engine DELIVER_SM Reassembly */
+    smpp_server_session_t srv_sess;
+    memset(&srv_sess, 0, sizeof(srv_sess));
+    srv_sess.state = SMPP_STATE_BOUND_TRX;
+    strcpy(srv_sess.account_id, "test_client");
+
+    test_server_deliver_called = 0;
+    test_server_deliver_body[0] = '\0';
+    smpp_server_set_deliver_cb(on_test_server_deliver);
+
+    /* Construct 2 DELIVER_SM PDUs with UDH */
+    smpp_pdu_t pdu1, pdu2;
+    memset(&pdu1, 0, sizeof(pdu1));
+    memset(&pdu2, 0, sizeof(pdu2));
+    smpp_header_init(&pdu1.header, SMPP_CMD_DELIVER_SM, ESME_ROK, 501);
+    smpp_header_init(&pdu2.header, SMPP_CMD_DELIVER_SM, ESME_ROK, 502);
+    strcpy(pdu1.body.msg.source_addr, "905320000001");
+    strcpy(pdu1.body.msg.destination_addr, "905320000002");
+    strcpy(pdu2.body.msg.source_addr, "905320000001");
+    strcpy(pdu2.body.msg.destination_addr, "905320000002");
+
+    pdu1.body.msg.esm_class = 0x40;
+    pdu1.body.msg.short_message[0] = 0x05;
+    pdu1.body.msg.short_message[1] = 0x00;
+    pdu1.body.msg.short_message[2] = 0x03;
+    pdu1.body.msg.short_message[3] = 0x33;
+    pdu1.body.msg.short_message[4] = 2;
+    pdu1.body.msg.short_message[5] = 1;
+    memcpy(&pdu1.body.msg.short_message[6], "KAMAILIO-", 9);
+    pdu1.body.msg.sm_length = 6 + 9;
+
+    pdu2.body.msg.esm_class = 0x40;
+    pdu2.body.msg.short_message[0] = 0x05;
+    pdu2.body.msg.short_message[1] = 0x00;
+    pdu2.body.msg.short_message[2] = 0x03;
+    pdu2.body.msg.short_message[3] = 0x33;
+    pdu2.body.msg.short_message[4] = 2;
+    pdu2.body.msg.short_message[5] = 2;
+    memcpy(&pdu2.body.msg.short_message[6], "MULTIPART", 9);
+    pdu2.body.msg.sm_length = 6 + 9;
+
+    uint8_t pdu1_buf[512], pdu2_buf[512], resp1_buf[512], resp2_buf[512];
+    size_t pdu1_len = 0, pdu2_len = 0, resp1_len = 0, resp2_len = 0;
+    smpp_pdu_pack(&pdu1, pdu1_buf, sizeof(pdu1_buf), &pdu1_len);
+    smpp_pdu_pack(&pdu2, pdu2_buf, sizeof(pdu2_buf), &pdu2_len);
+
+    /* Process PDU 1 on server */
+    int srv_rc = smpp_server_handle_pdu(&srv_sess, pdu1_buf, pdu1_len, resp1_buf, sizeof(resp1_buf), &resp1_len);
+    TEST_ASSERT(srv_rc == 0, "Server processed DELIVER_SM segment 1 successfully");
+    TEST_ASSERT(test_server_deliver_called == 0, "Server deliver callback not triggered on incomplete segment 1");
+
+    /* Process PDU 2 on server */
+    srv_rc = smpp_server_handle_pdu(&srv_sess, pdu2_buf, pdu2_len, resp2_buf, sizeof(resp2_buf), &resp2_len);
+    TEST_ASSERT(srv_rc == 0, "Server processed DELIVER_SM segment 2 successfully");
+    TEST_ASSERT(test_server_deliver_called == 1, "Server deliver callback triggered on final segment");
+    TEST_ASSERT(strcmp(test_server_deliver_body, "KAMAILIO-MULTIPART") == 0,
+                "Server delivered reassembled message body 'KAMAILIO-MULTIPART'");
+
+    /* 13. Client Multi-Part Helper */
+    smpp_client_conn_t sim_client;
+    memset(&sim_client, 0, sizeof(sim_client));
+    strcpy(sim_client.smsc_id, "sim_test_concat");
+    sim_client.state = SMPP_STATE_BOUND_TRX;
+    sim_client.sock_fd = 9999; /* Mock non-existent fd */
+    pthread_mutex_init(&sim_client.resp_mutex, NULL);
+    pthread_cond_init(&sim_client.resp_cond, NULL);
+    char out_first_id[65] = {0};
+
+    int client_rc = smpp_client_send_multipart(&sim_client, "SENDER", "905321234567",
+                                               (const uint8_t *)gsm_long, 320, SMPP_ENCODING_DEFAULT, 1, out_first_id);
+    TEST_ASSERT(client_rc == -3, "smpp_client_send_multipart segments long text and attempts sequential send (-3 on test socket)");
+
+    pthread_mutex_destroy(&sim_client.resp_mutex);
+    pthread_cond_destroy(&sim_client.resp_cond);
+
+    /* Free allocations */
+    smpp_free_segments(sar_segs, 3);
+    smpp_pdu_free(&pdu1);
+    smpp_pdu_free(&pdu2);
 }
 
 
@@ -640,6 +1033,8 @@ int main(void)
     test_dlr_normalization();
     test_mnp_and_enum();
     test_rest_api_suite();
+    test_dynamic_ton_npi();
+    test_multipart_segmentation_reassembly();
 
     printf("\n====================================================\n");
     printf("Total Tests: %d | Passed: %d | Failed: %d\n",

@@ -40,4 +40,7 @@ int smpp_manip_check_blacklist(const char *body, uint32_t *rejected_status);
 int smpp_manip_normalize_msisdn(const char *in_num, char *out_e164, size_t max_len,
                                 uint8_t *out_ton, uint8_t *out_npi, const char *default_country_code);
 
+/* Intelligent TON/NPI auto-detection */
+void smpp_detect_ton_npi(const char *addr, uint8_t *ton, uint8_t *npi);
+
 #endif /* _SMPP_MANIP_H_ */

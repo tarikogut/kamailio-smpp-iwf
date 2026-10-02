@@ -462,9 +462,9 @@ request_route {
 ```bash
 gcc -Wall -O2 test_smpp.c smpp_pdu.c smpp_tlv.c smpp_manip.c smpp_ratelimit.c \
   smpp_nli.c smpp_interwork.c smpp_dlr.c smpp_config.c smpp_client.c \
-  smpp_server.c smpp_mnp.c smpp_http_api.c -lpthread -o test_smpp && ./test_smpp
+  smpp_server.c smpp_mnp.c smpp_http_api.c smpp_concat.c -lpthread -o test_smpp && ./test_smpp
 ```
-Result: **13 Test Suites, 113 Tests Passed, 0 Failures.**
+Result: **15 Test Suites, 210 Tests Passed, 0 Failures.**
 
 
 ---

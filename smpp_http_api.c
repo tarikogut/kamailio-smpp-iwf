@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -132,6 +133,36 @@ static int json_extract_string(const char *json, const char *key, char *out, siz
     return 0;
 }
 
+static int json_extract_uint8(const char *json, const char *key, uint8_t *val)
+{
+    if (!json || !key || !val) return -1;
+    char search_pattern[64];
+    snprintf(search_pattern, sizeof(search_pattern), "\"%s\"", key);
+    const char *p = strstr(json, search_pattern);
+    if (!p) return -1;
+    p += strlen(search_pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return -1;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+
+    if (*p == '"') {
+        p++; /* string number */
+        char num_buf[16];
+        size_t idx = 0;
+        while (*p && *p != '"' && idx < sizeof(num_buf) - 1) {
+            num_buf[idx++] = *p++;
+        }
+        num_buf[idx] = '\0';
+        *val = (uint8_t)atoi(num_buf);
+        return 0;
+    } else if (isdigit((unsigned char)*p)) {
+        *val = (uint8_t)atoi(p);
+        return 0;
+    }
+    return -1;
+}
+
 int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp_buf, size_t max_resp, size_t *out_len)
 {
     (void)req_len;
@@ -214,6 +245,17 @@ int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp
             json_extract_string(body_start, "smsc", smsc_target, sizeof(smsc_target));
         }
 
+        uint8_t src_ton = 0xFF;
+        uint8_t src_npi = 0xFF;
+        uint8_t dst_ton = 0xFF;
+        uint8_t dst_npi = 0xFF;
+        if (body_start) {
+            json_extract_uint8(body_start, "src_ton", &src_ton);
+            json_extract_uint8(body_start, "src_npi", &src_npi);
+            json_extract_uint8(body_start, "dst_ton", &dst_ton);
+            json_extract_uint8(body_start, "dst_npi", &dst_npi);
+        }
+
         if (!to_num[0] || !text_str[0]) {
             make_http_response(400, "Bad Request", "{\"error\":\"Missing required fields ('to' and 'text')\"}",
                                resp_buf, max_resp, out_len);
@@ -228,9 +270,10 @@ int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp
         char out_mid[65] = {0};
         int send_rc = -1;
         if (conn) {
-            send_rc = smpp_client_send_submit_sm(conn, from_num[0] ? from_num : "API", to_num,
-                                                 (const uint8_t *)text_str, (uint8_t)strlen(text_str),
-                                                 0, 0, NULL, out_mid);
+            send_rc = smpp_client_send_submit_sm_ex(conn, from_num[0] ? from_num : "API", to_num,
+                                                    src_ton, src_npi, dst_ton, dst_npi,
+                                                    (const uint8_t *)text_str, (uint8_t)strlen(text_str),
+                                                    0, 0, NULL, out_mid);
         }
 
         if (send_rc != 0) {

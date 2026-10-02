@@ -30,6 +30,10 @@ void smpp_server_stop(void);
 typedef int (*smpp_server_submit_cb_t)(smpp_server_session_t *sess, const smpp_msg_t *msg, char *out_msg_id);
 void smpp_server_set_submit_cb(smpp_server_submit_cb_t cb);
 
+/* Callback when server receives a valid DELIVER_SM (reassembled if multipart) */
+typedef int (*smpp_server_deliver_cb_t)(smpp_server_session_t *sess, const smpp_msg_t *msg);
+void smpp_server_set_deliver_cb(smpp_server_deliver_cb_t cb);
+
 /* Process an incoming PDU from a connected client */
 int smpp_server_handle_pdu(smpp_server_session_t *sess, const uint8_t *in_buf, size_t in_len,
                            uint8_t *out_buf, size_t max_out, size_t *out_len);

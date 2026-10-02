@@ -5,6 +5,7 @@
 */
 
 #include "smpp_interwork.h"
+#include "smpp_manip.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -82,9 +83,8 @@ int http_json_to_smpp(const char *in_json, smpp_msg_t *msg)
         memcpy(msg->short_message, text, msg->sm_length);
     }
 
-    msg->source_addr_ton = SMPP_TON_ALPHANUMERIC;
-    msg->dest_addr_ton = SMPP_TON_INTERNATIONAL;
-    msg->dest_addr_npi = SMPP_NPI_ISDN;
+    smpp_detect_ton_npi(msg->source_addr, &msg->source_addr_ton, &msg->source_addr_npi);
+    smpp_detect_ton_npi(msg->destination_addr, &msg->dest_addr_ton, &msg->dest_addr_npi);
     msg->data_coding = SMPP_ENCODING_DEFAULT;
 
     return 0;

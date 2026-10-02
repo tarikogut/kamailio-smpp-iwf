@@ -5,6 +5,8 @@
 */
 
 #include "smpp_client.h"
+#include "smpp_manip.h"
+#include "smpp_concat.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -290,11 +292,19 @@ int smpp_client_disconnect(smpp_client_conn_t *conn)
     return 0;
 }
 
-int smpp_client_send_submit_sm(smpp_client_conn_t *conn, const char *src, const char *dst,
-                              const uint8_t *msg_data, uint8_t msg_len, uint8_t data_coding,
-                              uint8_t esm_class, smpp_tlv_t *tlvs, char *out_msg_id)
+int smpp_client_send_submit_sm_ex(smpp_client_conn_t *conn, const char *src, const char *dst,
+                                 uint8_t src_ton, uint8_t src_npi, uint8_t dst_ton, uint8_t dst_npi,
+                                 const uint8_t *msg_data, uint8_t msg_len, uint8_t data_coding,
+                                 uint8_t esm_class, smpp_tlv_t *tlvs, char *out_msg_id)
 {
     if (!conn || conn->sock_fd < 0 || conn->state != SMPP_STATE_BOUND_TRX) return -1;
+
+    /* Auto-segment messages that exceed single PDU limit and have no segmentation headers attached */
+    size_t threshold = (data_coding == SMPP_ENCODING_UCS2) ? SMPP_CONCAT_UCS2_MAX_SINGLE : SMPP_CONCAT_GSM_MAX_SINGLE;
+    if (msg_len > threshold && (esm_class & 0x40) == 0 && !smpp_tlv_find(tlvs, SMPP_TLV_SAR_TOTAL_SEGMENTS)) {
+        return smpp_client_send_multipart_ex(conn, src, dst, src_ton, src_npi, dst_ton, dst_npi,
+                                             msg_data, msg_len, data_coding, 1 /* use_udh */, out_msg_id);
+    }
 
     smpp_pdu_t pdu;
     memset(&pdu, 0, sizeof(pdu));
@@ -303,10 +313,22 @@ int smpp_client_send_submit_sm(smpp_client_conn_t *conn, const char *src, const 
 
     if (src) strncpy(pdu.body.msg.source_addr, src, sizeof(pdu.body.msg.source_addr) - 1);
     if (dst) strncpy(pdu.body.msg.destination_addr, dst, sizeof(pdu.body.msg.destination_addr) - 1);
-    pdu.body.msg.source_addr_ton = SMPP_TON_ALPHANUMERIC;
-    pdu.body.msg.source_addr_npi = SMPP_NPI_UNKNOWN;
-    pdu.body.msg.dest_addr_ton = SMPP_TON_INTERNATIONAL;
-    pdu.body.msg.dest_addr_npi = SMPP_NPI_ISDN;
+
+    /* Determine Source TON and NPI */
+    if (src_ton == 0xFF || src_npi == 0xFF || (src_ton == 0 && src_npi == 0)) {
+        smpp_detect_ton_npi(pdu.body.msg.source_addr, &pdu.body.msg.source_addr_ton, &pdu.body.msg.source_addr_npi);
+    } else {
+        pdu.body.msg.source_addr_ton = src_ton;
+        pdu.body.msg.source_addr_npi = src_npi;
+    }
+
+    /* Determine Destination TON and NPI */
+    if (dst_ton == 0xFF || dst_npi == 0xFF || (dst_ton == 0 && dst_npi == 0)) {
+        smpp_detect_ton_npi(pdu.body.msg.destination_addr, &pdu.body.msg.dest_addr_ton, &pdu.body.msg.dest_addr_npi);
+    } else {
+        pdu.body.msg.dest_addr_ton = dst_ton;
+        pdu.body.msg.dest_addr_npi = dst_npi;
+    }
 
     pdu.body.msg.data_coding = data_coding;
     pdu.body.msg.esm_class = esm_class;
@@ -376,6 +398,65 @@ int smpp_client_send_submit_sm(smpp_client_conn_t *conn, const char *src, const 
     pthread_mutex_unlock(&conn->resp_mutex);
 
     return res;
+}
+
+int smpp_client_send_submit_sm(smpp_client_conn_t *conn, const char *src, const char *dst,
+                              const uint8_t *msg_data, uint8_t msg_len, uint8_t data_coding,
+                              uint8_t esm_class, smpp_tlv_t *tlvs, char *out_msg_id)
+{
+    return smpp_client_send_submit_sm_ex(conn, src, dst, 0xFF, 0xFF, 0xFF, 0xFF,
+                                        msg_data, msg_len, data_coding, esm_class, tlvs, out_msg_id);
+}
+
+int smpp_client_send_multipart_ex(smpp_client_conn_t *conn, const char *src, const char *dst,
+                                 uint8_t src_ton, uint8_t src_npi, uint8_t dst_ton, uint8_t dst_npi,
+                                 const uint8_t *msg_data, size_t msg_len, uint8_t data_coding,
+                                 int use_udh, char *out_first_msg_id)
+{
+    if (!conn || !msg_data || msg_len == 0) return -1;
+
+    static uint16_t concat_ref_counter = 1;
+    uint16_t ref = (uint16_t)__sync_fetch_and_add(&concat_ref_counter, 1);
+    if (ref == 0) ref = (uint16_t)__sync_fetch_and_add(&concat_ref_counter, 1);
+
+    smpp_msg_t segments[SMPP_CONCAT_MAX_PARTS];
+    int n_segs = smpp_split_message(msg_data, msg_len, data_coding, use_udh, ref, segments, SMPP_CONCAT_MAX_PARTS);
+    if (n_segs <= 0) return -2;
+
+    int overall_rc = 0;
+    char first_id[65] = {0};
+
+    for (int i = 0; i < n_segs; i++) {
+        char seg_msg_id[65] = {0};
+        int rc = smpp_client_send_submit_sm_ex(conn, src, dst, src_ton, src_npi, dst_ton, dst_npi,
+                                              segments[i].short_message, segments[i].sm_length,
+                                              segments[i].data_coding, segments[i].esm_class,
+                                              segments[i].tlvs, seg_msg_id);
+        if (i == 0 && rc == 0) {
+            strncpy(first_id, seg_msg_id, sizeof(first_id) - 1);
+        }
+        if (rc != 0) {
+            overall_rc = rc;
+            break;
+        }
+    }
+
+    smpp_free_segments(segments, n_segs);
+
+    if (overall_rc == 0 && out_first_msg_id) {
+        strncpy(out_first_msg_id, first_id, 64);
+        out_first_msg_id[64] = '\0';
+    }
+
+    return overall_rc;
+}
+
+int smpp_client_send_multipart(smpp_client_conn_t *conn, const char *src, const char *dst,
+                              const uint8_t *msg_data, size_t msg_len, uint8_t data_coding,
+                              int use_udh, char *out_first_msg_id)
+{
+    return smpp_client_send_multipart_ex(conn, src, dst, 0xFF, 0xFF, 0xFF, 0xFF,
+                                         msg_data, msg_len, data_coding, use_udh, out_first_msg_id);
 }
 
 int smpp_client_send_enquire_link(smpp_client_conn_t *conn)

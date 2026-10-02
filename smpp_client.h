@@ -61,9 +61,25 @@ int smpp_client_send_submit_sm(smpp_client_conn_t *conn, const char *src, const 
                               const uint8_t *msg_data, uint8_t msg_len, uint8_t data_coding,
                               uint8_t esm_class, smpp_tlv_t *tlvs, char *out_msg_id);
 
+int smpp_client_send_submit_sm_ex(smpp_client_conn_t *conn, const char *src, const char *dst,
+                                 uint8_t src_ton, uint8_t src_npi, uint8_t dst_ton, uint8_t dst_npi,
+                                 const uint8_t *msg_data, uint8_t msg_len, uint8_t data_coding,
+                                 uint8_t esm_class, smpp_tlv_t *tlvs, char *out_msg_id);
+
+#include "smpp_concat.h"
+
 int smpp_client_send_enquire_link(smpp_client_conn_t *conn);
 
 smpp_client_conn_t *smpp_client_find(const char *smsc_id);
+
+int smpp_client_send_multipart(smpp_client_conn_t *conn, const char *src, const char *dst,
+                              const uint8_t *msg_data, size_t msg_len, uint8_t data_coding,
+                              int use_udh, char *out_first_msg_id);
+
+int smpp_client_send_multipart_ex(smpp_client_conn_t *conn, const char *src, const char *dst,
+                                 uint8_t src_ton, uint8_t src_npi, uint8_t dst_ton, uint8_t dst_npi,
+                                 const uint8_t *msg_data, size_t msg_len, uint8_t data_coding,
+                                 int use_udh, char *out_first_msg_id);
 
 #endif /* _SMPP_CLIENT_H_ */
 

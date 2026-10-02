@@ -26,6 +26,7 @@
 #include "smpp_dlr.h"
 #include "smpp_mnp.h"
 #include "smpp_http_api.h"
+#include "smpp_concat.h"
 #include "smpp_pv.h"
 #include "smpp_rpc.h"
 
@@ -55,12 +56,15 @@ static void on_client_deliver(const char *smsc_id, const smpp_msg_t *msg);
 
 /* Script Commands Prototypes */
 static int w_smpp_send(struct sip_msg *msg, char *smsc, char *src, char *dst, char *text);
+static int w_smpp_send_ex(struct sip_msg *msg, char *smsc, char *src, char *dst, char *text, char *src_ton, char *dst_ton);
 static int w_smpp_append_suffix(struct sip_msg *msg, char *suffix);
 static int w_smpp_prepend_prefix(struct sip_msg *msg, char *prefix);
 
 /* Exported Functions */
 static cmd_export_t cmds[] = {
     {"smpp_send", (cmd_function)w_smpp_send, 4, fixup_spve_all, fixup_free_spve_all,
+        REQUEST_ROUTE | FAILURE_ROUTE | ONREPLY_ROUTE | BRANCH_ROUTE | LOCAL_ROUTE},
+    {"smpp_send_ex", (cmd_function)w_smpp_send_ex, 6, fixup_spve_all, fixup_free_spve_all,
         REQUEST_ROUTE | FAILURE_ROUTE | ONREPLY_ROUTE | BRANCH_ROUTE | LOCAL_ROUTE},
     {"smpp_append_suffix", (cmd_function)w_smpp_append_suffix, 1, fixup_spve_null, fixup_free_spve_null,
         REQUEST_ROUTE | FAILURE_ROUTE | ONREPLY_ROUTE | BRANCH_ROUTE | LOCAL_ROUTE},
@@ -118,6 +122,7 @@ static int mod_init(void)
     smpp_ratelimit_init();
     smpp_config_init();
     smpp_client_init();
+    smpp_reassembly_init(60);
     smpp_mnp_init();
     smpp_init_rpc();
 
@@ -243,11 +248,25 @@ static void on_client_deliver(const char *smsc_id, const smpp_msg_t *msg)
                                                     (const uint8_t *)healed_body, (uint8_t)b_len, msg->esm_class);
         LM_INFO("Forwarded deliver_sm (DLR) to %d connected ESME client(s)\n", forwarded);
     } else {
-        /* Standard inbound MO SMS */
+        /* Standard inbound MO SMS - reassemble if multipart */
+        uint8_t assembled_buf[4096];
+        size_t assembled_len = 0;
+        int rc = smpp_reassemble_msg(msg, assembled_buf, sizeof(assembled_buf), &assembled_len);
+        if (rc == 0) {
+            LM_INFO("Inbound MO SMS segment buffered; awaiting further segments from '%s'\n",
+                    msg->source_addr);
+            return;
+        }
+
+        /* Message is complete (either single part or all fragments reassembled) */
+        const uint8_t *payload_ptr = (rc == 1 && assembled_len > 0) ? assembled_buf : msg->short_message;
+        size_t payload_len = (rc == 1 && assembled_len > 0) ? assembled_len : msg->sm_length;
+        uint8_t esm = msg->esm_class & ~0x40; /* Clear UDHI */
+
         int forwarded = smpp_server_send_deliver_sm(NULL, msg->source_addr, msg->destination_addr,
-                                                    msg->short_message, msg->sm_length, msg->esm_class);
-        LM_INFO("Forwarded inbound MO SMS from '%s' to %d connected ESME client(s)\n",
-                msg->source_addr, forwarded);
+                                                    payload_ptr, (uint8_t)(payload_len > 255 ? 255 : payload_len), esm);
+        LM_INFO("Forwarded inbound MO SMS from '%s' to %d connected ESME client(s) (len=%zu)\n",
+                msg->source_addr, forwarded, payload_len);
     }
 }
 
@@ -269,6 +288,7 @@ static void destroy(void)
     }
     smpp_server_stop();
     smpp_client_destroy();
+    smpp_reassembly_destroy();
     smpp_config_destroy();
     smpp_ratelimit_destroy();
     smpp_mnp_destroy();
@@ -309,10 +329,12 @@ static int on_server_submit(smpp_server_session_t *sess, const smpp_msg_t *msg, 
 
     if (conn) {
         char remote_msg_id[65] = {0};
-        int rc = smpp_client_send_submit_sm(conn, msg->source_addr, msg->destination_addr,
-                                            msg->short_message, msg->sm_length,
-                                            msg->data_coding, msg->esm_class,
-                                            NULL, remote_msg_id);
+        int rc = smpp_client_send_submit_sm_ex(conn, msg->source_addr, msg->destination_addr,
+                                                msg->source_addr_ton, msg->source_addr_npi,
+                                                msg->dest_addr_ton, msg->dest_addr_npi,
+                                                msg->short_message, msg->sm_length,
+                                                msg->data_coding, msg->esm_class,
+                                                NULL, remote_msg_id);
         if (rc == 0) {
             LM_INFO("Successfully forwarded SUBMIT_SM to SMSC '%s' (Remote MsgID: %s)\n",
                     conn->smsc_id, remote_msg_id);
@@ -410,6 +432,104 @@ static int w_smpp_send(struct sip_msg *msg, char *smsc, char *src, char *dst, ch
     return -1;
 }
 
+static int w_smpp_send_ex(struct sip_msg *msg, char *smsc, char *src, char *dst, char *text, char *src_ton, char *dst_ton)
+{
+    str s_smsc = {0, 0};
+    str s_src = {0, 0};
+    str s_dst = {0, 0};
+    str s_text = {0, 0};
+    str s_src_ton = {0, 0};
+    str s_dst_ton = {0, 0};
+
+    if (fixup_get_svalue(msg, (fparam_t *)smsc, &s_smsc) < 0) {
+        LM_ERR("Failed to evaluate smsc parameter\n");
+        return -1;
+    }
+    if (src && fixup_get_svalue(msg, (fparam_t *)src, &s_src) < 0) {
+        LM_ERR("Failed to evaluate src parameter\n");
+        return -1;
+    }
+    if (fixup_get_svalue(msg, (fparam_t *)dst, &s_dst) < 0) {
+        LM_ERR("Failed to evaluate dst parameter\n");
+        return -1;
+    }
+    if (fixup_get_svalue(msg, (fparam_t *)text, &s_text) < 0) {
+        LM_ERR("Failed to evaluate text parameter\n");
+        return -1;
+    }
+
+    uint8_t u_src_ton = 0xFF;
+    if (src_ton && fixup_get_svalue(msg, (fparam_t *)src_ton, &s_src_ton) == 0 && s_src_ton.len > 0) {
+        u_src_ton = (uint8_t)atoi(s_src_ton.s);
+    }
+
+    uint8_t u_dst_ton = 0xFF;
+    if (dst_ton && fixup_get_svalue(msg, (fparam_t *)dst_ton, &s_dst_ton) == 0 && s_dst_ton.len > 0) {
+        u_dst_ton = (uint8_t)atoi(s_dst_ton.s);
+    }
+
+    char c_smsc[32] = {0};
+    size_t slen = s_smsc.len < 31 ? s_smsc.len : 31;
+    memcpy(c_smsc, s_smsc.s, slen);
+
+    char c_src[32] = {0};
+    if (s_src.s && s_src.len > 0) {
+        size_t srclen = s_src.len < 31 ? s_src.len : 31;
+        memcpy(c_src, s_src.s, srclen);
+    }
+
+    char c_dst[32] = {0};
+    size_t dlen = s_dst.len < 31 ? s_dst.len : 31;
+    memcpy(c_dst, s_dst.s, dlen);
+
+    char c_text[256] = {0};
+    size_t tlen = s_text.len < 255 ? s_text.len : 255;
+    memcpy(c_text, s_text.s, tlen);
+
+    LM_INFO("smpp_send_ex called: smsc='%s', src='%s', dst='%s', text='%s', src_ton=%u, dst_ton=%u\n",
+            c_smsc, c_src, c_dst, c_text, u_src_ton, u_dst_ton);
+
+    /* In-flight context update */
+    smpp_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    strncpy(ctx.src, c_src, sizeof(ctx.src) - 1);
+    strncpy(ctx.dst, c_dst, sizeof(ctx.dst) - 1);
+    strncpy(ctx.body, c_text, sizeof(ctx.body) - 1);
+    smpp_ctx_set_current(&ctx);
+
+    smpp_client_conn_t *conn = smpp_client_find(c_smsc);
+    if (!conn) {
+        smpp_smsc_profile_t *p = smpp_config_find_smsc(c_smsc);
+        if (p) {
+            conn = smpp_client_connect(p);
+        }
+    }
+
+    if (!conn) {
+        LM_ERR("SMSC '%s' not found or failed to connect\n", c_smsc);
+        return -1;
+    }
+
+    char out_msg_id[65] = {0};
+    uint8_t sm_data[256];
+    uint8_t sm_len = (uint8_t)strlen(c_text);
+    if (sm_len > 255) sm_len = 255;
+    memcpy(sm_data, c_text, sm_len);
+
+    int rc = smpp_client_send_submit_sm_ex(conn, c_src, c_dst,
+                                           u_src_ton, 0xFF, u_dst_ton, 0xFF,
+                                           sm_data, sm_len,
+                                           SMPP_ENCODING_DEFAULT, 0, NULL, out_msg_id);
+    if (rc == 0) {
+        LM_INFO("smpp_send_ex success to '%s': MsgID=%s\n", c_smsc, out_msg_id);
+        smpp_http_api_record_msg(out_msg_id, c_src[0] ? c_src : "SIP", c_dst, "SUBMITTED", c_smsc);
+        return 1;
+    }
+
+    LM_ERR("smpp_send_ex to '%s' failed with error code %d\n", c_smsc, rc);
+    return -1;
+}
+
 static int w_smpp_append_suffix(struct sip_msg *msg, char *suffix)
 {
     if (!suffix) return -1;
@@ -460,6 +580,75 @@ static int ki_smpp_send(sip_msg_t *msg, str *smsc, str *src, str *dst, str *text
     return w_smpp_send((struct sip_msg *)msg, smsc_buf, src_buf, dst_buf, txt_buf);
 }
 
+static int ki_smpp_send_ex(sip_msg_t *msg, str *smsc, str *src, str *dst, str *text, int src_ton, int dst_ton)
+{
+    if (!smsc || !dst || !text || smsc->len == 0 || dst->len == 0 || text->len == 0) {
+        LM_ERR("KEMI smpp.send_ex: invalid parameters\n");
+        return -1;
+    }
+
+    char smsc_buf[32] = {0};
+    size_t slen = smsc->len < 31 ? smsc->len : 31;
+    memcpy(smsc_buf, smsc->s, slen);
+
+    char src_buf[32] = {0};
+    if (src && src->len > 0) {
+        size_t srclen = src->len < 31 ? src->len : 31;
+        memcpy(src_buf, src->s, srclen);
+    }
+
+    char dst_buf[32] = {0};
+    size_t dlen = dst->len < 31 ? dst->len : 31;
+    memcpy(dst_buf, dst->s, dlen);
+
+    char txt_buf[256] = {0};
+    size_t tlen = text->len < 255 ? text->len : 255;
+    memcpy(txt_buf, text->s, tlen);
+
+    LM_INFO("KEMI smpp.send_ex: smsc='%s', src='%s', dst='%s', text='%s', src_ton=%d, dst_ton=%d\n",
+            smsc_buf, src_buf, dst_buf, txt_buf, src_ton, dst_ton);
+
+    /* In-flight context update */
+    smpp_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    strncpy(ctx.src, src_buf, sizeof(ctx.src) - 1);
+    strncpy(ctx.dst, dst_buf, sizeof(ctx.dst) - 1);
+    strncpy(ctx.body, txt_buf, sizeof(ctx.body) - 1);
+    smpp_ctx_set_current(&ctx);
+
+    smpp_client_conn_t *conn = smpp_client_find(smsc_buf);
+    if (!conn) {
+        smpp_smsc_profile_t *p = smpp_config_find_smsc(smsc_buf);
+        if (p) {
+            conn = smpp_client_connect(p);
+        }
+    }
+
+    if (!conn) {
+        LM_ERR("SMSC '%s' not found or failed to connect\n", smsc_buf);
+        return -1;
+    }
+
+    char out_msg_id[65] = {0};
+    uint8_t sm_data[256];
+    uint8_t sm_len = (uint8_t)strlen(txt_buf);
+    if (sm_len > 255) sm_len = 255;
+    memcpy(sm_data, txt_buf, sm_len);
+
+    int rc = smpp_client_send_submit_sm_ex(conn, src_buf, dst_buf,
+                                           (uint8_t)src_ton, 0xFF, (uint8_t)dst_ton, 0xFF,
+                                           sm_data, sm_len,
+                                           SMPP_ENCODING_DEFAULT, 0, NULL, out_msg_id);
+    if (rc == 0) {
+        LM_INFO("smpp_send_ex success to '%s': MsgID=%s\n", smsc_buf, out_msg_id);
+        smpp_http_api_record_msg(out_msg_id, src_buf[0] ? src_buf : "SIP", dst_buf, "SUBMITTED", smsc_buf);
+        return 1;
+    }
+
+    LM_ERR("smpp_send_ex to '%s' failed with error code %d\n", smsc_buf, rc);
+    return -1;
+}
+
 static str ki_smpp_mnp_lookup(sip_msg_t *msg, str *msisdn)
 {
     static char target_buf[32];
@@ -484,6 +673,9 @@ static sr_kemi_t sr_kemi_smpp_exports[] = {
     {str_init("smpp"), str_init("send"),
         SR_KEMIP_INT, ki_smpp_send,
         {SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE}},
+    {str_init("smpp"), str_init("send_ex"),
+        SR_KEMIP_INT, ki_smpp_send_ex,
+        {SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_INT, SR_KEMIP_INT}},
     {str_init("smpp"), str_init("mnp_lookup"),
         SR_KEMIP_STR, ki_smpp_mnp_lookup,
         {SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE}},

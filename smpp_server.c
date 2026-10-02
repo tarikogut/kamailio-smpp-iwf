@@ -7,6 +7,7 @@
 #include "smpp_server.h"
 #include "smpp_ratelimit.h"
 #include "smpp_manip.h"
+#include "smpp_concat.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -25,11 +26,19 @@ static uint32_t global_msg_counter = 1000;
 static pthread_mutex_t server_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t server_thread;
 static smpp_server_submit_cb_t server_submit_cb = NULL;
+static smpp_server_deliver_cb_t server_deliver_cb = NULL;
 
 void smpp_server_set_submit_cb(smpp_server_submit_cb_t cb)
 {
     pthread_mutex_lock(&server_mutex);
     server_submit_cb = cb;
+    pthread_mutex_unlock(&server_mutex);
+}
+
+void smpp_server_set_deliver_cb(smpp_server_deliver_cb_t cb)
+{
+    pthread_mutex_lock(&server_mutex);
+    server_deliver_cb = cb;
     pthread_mutex_unlock(&server_mutex);
 }
 
@@ -338,6 +347,35 @@ int smpp_server_handle_pdu(smpp_server_session_t *sess, const uint8_t *in_buf, s
 
             if (cb) {
                 cb(sess, &in_pdu.body.msg, resp_pdu.body.msg_resp.message_id);
+            }
+        }
+        break;
+    }
+
+    case SMPP_CMD_DELIVER_SM: {
+        uint32_t status = ESME_ROK;
+        if (sess->state != SMPP_STATE_BOUND_TRX && sess->state != SMPP_STATE_BOUND_RX) {
+            status = ESME_RINVBNDSTS;
+        }
+
+        smpp_header_init(&resp_pdu.header, SMPP_CMD_DELIVER_SM_RESP, status, seq);
+        if (status == ESME_ROK) {
+            uint8_t assembled_buf[4096];
+            size_t assembled_len = 0;
+            int reasm_res = smpp_reassemble_msg(&in_pdu.body.msg, assembled_buf, sizeof(assembled_buf), &assembled_len);
+            if (reasm_res == 1) {
+                smpp_msg_t full_msg = in_pdu.body.msg;
+                full_msg.esm_class &= ~0x40; /* Clear UDHI */
+                if (assembled_len <= sizeof(full_msg.short_message)) {
+                    memcpy(full_msg.short_message, assembled_buf, assembled_len);
+                    full_msg.sm_length = (uint8_t)assembled_len;
+                }
+                pthread_mutex_lock(&server_mutex);
+                smpp_server_deliver_cb_t cb = server_deliver_cb;
+                pthread_mutex_unlock(&server_mutex);
+                if (cb) {
+                    cb(sess, &full_msg);
+                }
             }
         }
         break;
