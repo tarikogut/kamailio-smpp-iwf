@@ -19,6 +19,7 @@
 #include "smpp_config.h"
 #include "smpp_server.h"
 #include "smpp_interwork.h"
+#include "smpp_http_api.h"
 
 char *smpp_msgid_format = "%PREFIX%-%TIMESTAMP%-%HEXSEQ%";
 
@@ -447,6 +448,99 @@ static void test_mnp_and_enum(void)
     smpp_mnp_destroy();
 }
 
+static void test_rest_api_suite(void)
+{
+    printf("\n=== Running Test Suite 13: Built-in REST API Server (Management, Send, Query) ===\n");
+
+    /* 1. Test /api/v1/health */
+    const char *req_health = 
+        "GET /api/v1/health HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "\r\n";
+    char resp_buf[2048];
+    size_t resp_len = 0;
+    int rc = smpp_http_api_handle_request(req_health, strlen(req_health), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "HTTP Health check handled successfully");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "Health check returns HTTP 200 OK");
+    TEST_ASSERT(strstr(resp_buf, "\"status\":\"healthy\"") != NULL, "Health check body contains status:healthy");
+
+    /* 2. Test /api/v1/status */
+    const char *req_status = 
+        "GET /api/v1/status HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_status, strlen(req_status), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "HTTP Status handled successfully");
+    TEST_ASSERT(strstr(resp_buf, "\"service\":\"kamailio-smpp-iwf\"") != NULL, "Status contains service name");
+
+    /* 3. Test Unauthorized Access without Token */
+    const char *req_unauth = 
+        "POST /api/v1/reload HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_unauth, strlen(req_unauth), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "Unauthorized request handled");
+    TEST_ASSERT(strstr(resp_buf, "401 Unauthorized") != NULL, "Protected endpoint returns 401 without Bearer token");
+
+    /* 4. Test Authorized Reload with Token */
+    const char *req_reload = 
+        "POST /api/v1/reload HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_reload, strlen(req_reload), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "Authorized reload request handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "Authorized reload returns 200 OK");
+    TEST_ASSERT(strstr(resp_buf, "\"reload\":\"success\"") != NULL, "Reload body reports success");
+
+    /* 5. Test SMS Dispatch via POST /api/v1/sms/send */
+    const char *json_payload = 
+        "{\"smsc_id\":\"sim1\",\"from\":\"KAMAILIO\",\"to\":\"905321234567\",\"text\":\"REST API Test SMS\"}";
+    char req_send[1024];
+    snprintf(req_send, sizeof(req_send),
+        "POST /api/v1/sms/send HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n%s", strlen(json_payload), json_payload);
+
+    rc = smpp_http_api_handle_request(req_send, strlen(req_send), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "SMS send request handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "SMS send returns 200 OK");
+    TEST_ASSERT(strstr(resp_buf, "\"status\":\"accepted\"") != NULL, "SMS accepted for delivery");
+    TEST_ASSERT(strstr(resp_buf, "\"message_id\":\"") != NULL, "Response contains generated message_id");
+
+    /* Extract message_id from response for querying */
+    char *id_start = strstr(resp_buf, "\"message_id\":\"");
+    char test_msg_id[65] = {0};
+    if (id_start) {
+        id_start += 14;
+        char *id_end = strchr(id_start, '"');
+        if (id_end) {
+            strncpy(test_msg_id, id_start, id_end - id_start);
+        }
+    }
+    TEST_ASSERT(strlen(test_msg_id) > 0, "Extracted message_id from response");
+
+    /* 6. Test DLR / SMS Query via GET /api/v1/sms/query?id=<message_id> */
+    char req_query[512];
+    snprintf(req_query, sizeof(req_query),
+        "GET /api/v1/sms/query?id=%s HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n", test_msg_id);
+
+    rc = smpp_http_api_handle_request(req_query, strlen(req_query), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "SMS query handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "SMS query returns 200 OK");
+    TEST_ASSERT(strstr(resp_buf, test_msg_id) != NULL, "Query body contains matching message_id");
+    TEST_ASSERT(strstr(resp_buf, "\"status\":\"ACCEPTED\"") != NULL, "Query status returns ACCEPTED");
+}
+
 int main(void)
 {
     printf("====================================================\n");
@@ -465,6 +559,7 @@ int main(void)
     test_interworking_and_ims();
     test_dlr_normalization();
     test_mnp_and_enum();
+    test_rest_api_suite();
 
     printf("\n====================================================\n");
     printf("Total Tests: %d | Passed: %d | Failed: %d\n",

@@ -18,5 +18,9 @@ extern int smpp_reconnect_interval;
 extern char *smpp_db_url;
 extern int smpp_default_client_mps;
 extern char *smpp_msgid_format;
+extern int smpp_http_api_enable;
+extern int smpp_http_api_port;
+extern char *smpp_http_api_token;
 
 #endif /* _SMPP_MOD_H_ */
+

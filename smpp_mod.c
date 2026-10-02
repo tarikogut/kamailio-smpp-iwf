@@ -25,6 +25,7 @@
 #include "smpp_interwork.h"
 #include "smpp_dlr.h"
 #include "smpp_mnp.h"
+#include "smpp_http_api.h"
 #include "smpp_pv.h"
 #include "smpp_rpc.h"
 
@@ -40,6 +41,9 @@ int smpp_reconnect_interval = 10;
 char *smpp_db_url = NULL;
 int smpp_default_client_mps = 30;
 char *smpp_msgid_format = "%PREFIX%-%TIMESTAMP%-%HEXSEQ%";
+int smpp_http_api_enable = 1;
+int smpp_http_api_port = 8080;
+char *smpp_http_api_token = "secret-token-123";
 
 static int mod_init(void);
 static int child_init(int rank);
@@ -77,6 +81,9 @@ static param_export_t params[] = {
     {"enum_suffix",            PARAM_STRING, &smpp_enum_suffix},
     {"mnp_redis_host",         PARAM_STRING, &smpp_mnp_redis_host},
     {"mnp_cache_ttl",          PARAM_INT,    &smpp_mnp_cache_ttl},
+    {"http_api_enable",        PARAM_INT,    &smpp_http_api_enable},
+    {"http_api_port",          PARAM_INT,    &smpp_http_api_port},
+    {"http_api_token",         PARAM_STRING, &smpp_http_api_token},
     {0, 0, 0}
 };
 
@@ -184,6 +191,15 @@ static int mod_init(void)
         }
     }
 
+    /* Start HTTP REST API server if enabled */
+    if (smpp_http_api_enable && smpp_http_api_port > 0) {
+        if (smpp_http_api_start("0.0.0.0", smpp_http_api_port) == 0) {
+            LM_INFO("SMPP HTTP REST API active on port %d\n", smpp_http_api_port);
+        } else {
+            LM_WARN("Could not start SMPP HTTP REST API on port %d\n", smpp_http_api_port);
+        }
+    }
+
     return 0;
 }
 
@@ -199,6 +215,9 @@ static int child_init(int rank)
 static void destroy(void)
 {
     LM_INFO("Destroying SMPP (SMS-IWF) module\n");
+    if (smpp_http_api_enable) {
+        smpp_http_api_stop();
+    }
     smpp_server_stop();
     smpp_client_destroy();
     smpp_config_destroy();
