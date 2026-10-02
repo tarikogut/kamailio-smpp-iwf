@@ -22,8 +22,12 @@
 #include "smpp_http_api.h"
 
 char *smpp_msgid_format = "%PREFIX%-%TIMESTAMP%-%HEXSEQ%";
+int smpp_http_api_enable = 1;
+int smpp_http_api_port = 8080;
+char *smpp_http_api_token = "secret-token-123";
 
 static int tests_run = 0;
+
 static int tests_passed = 0;
 
 #define TEST_ASSERT(cond, msg) do { \
@@ -539,7 +543,83 @@ static void test_rest_api_suite(void)
     TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "SMS query returns 200 OK");
     TEST_ASSERT(strstr(resp_buf, test_msg_id) != NULL, "Query body contains matching message_id");
     TEST_ASSERT(strstr(resp_buf, "\"status\":\"ACCEPTED\"") != NULL, "Query status returns ACCEPTED");
+
+    /* 7. Test Connections CRUD: GET /api/v1/connections */
+    const char *req_conns = 
+        "GET /api/v1/connections HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_conns, strlen(req_conns), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "GET /api/v1/connections handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "Connections list returns 200 OK");
+    TEST_ASSERT(strstr(resp_buf, "\"connections\":[") != NULL, "Connections list returns json array");
+
+    /* 8. Test Add Connection: POST /api/v1/connections */
+    const char *conn_payload = 
+        "{\"smsc_id\":\"sim_api_test\",\"host\":\"127.0.0.1\",\"port\":2775,\"system_id\":\"test_sys\",\"password\":\"pwd\",\"default_b_code\":\"B999\"}";
+    char req_add_conn[1024];
+    snprintf(req_add_conn, sizeof(req_add_conn),
+        "POST /api/v1/connections HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n%s", strlen(conn_payload), conn_payload);
+
+    rc = smpp_http_api_handle_request(req_add_conn, strlen(req_add_conn), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "POST /api/v1/connections handled");
+    TEST_ASSERT(strstr(resp_buf, "201 Created") != NULL, "Connection created returns 201 Created");
+    TEST_ASSERT(strstr(resp_buf, "\"sim_api_test\"") != NULL, "Response mentions sim_api_test");
+
+    /* 9. Test Delete Connection: DELETE /api/v1/connections?id=sim_api_test */
+    const char *req_del_conn = 
+        "DELETE /api/v1/connections?id=sim_api_test HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_del_conn, strlen(req_del_conn), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "DELETE /api/v1/connections handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "Connection delete returns 200 OK");
+
+    /* 10. Test Users CRUD: GET /api/v1/users */
+    const char *req_users = 
+        "GET /api/v1/users HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_users, strlen(req_users), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "GET /api/v1/users handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "Users list returns 200 OK");
+
+    /* 11. Test Add/Update User: POST /api/v1/users */
+    const char *user_payload = 
+        "{\"account_id\":\"esme_api_user\",\"password\":\"secure_pass\",\"mps_limit\":150,\"burst_limit\":300}";
+    char req_add_user[1024];
+    snprintf(req_add_user, sizeof(req_add_user),
+        "POST /api/v1/users HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n%s", strlen(user_payload), user_payload);
+
+    rc = smpp_http_api_handle_request(req_add_user, strlen(req_add_user), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "POST /api/v1/users handled");
+    TEST_ASSERT(strstr(resp_buf, "201 Created") != NULL, "User created returns 201 Created");
+    TEST_ASSERT(strstr(resp_buf, "\"esme_api_user\"") != NULL, "Response mentions esme_api_user");
+
+    /* 12. Test Delete User: DELETE /api/v1/users?id=esme_api_user */
+    const char *req_del_user = 
+        "DELETE /api/v1/users?id=esme_api_user HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Bearer secret-token-123\r\n"
+        "\r\n";
+    rc = smpp_http_api_handle_request(req_del_user, strlen(req_del_user), resp_buf, sizeof(resp_buf), &resp_len);
+    TEST_ASSERT(rc == 0, "DELETE /api/v1/users handled");
+    TEST_ASSERT(strstr(resp_buf, "200 OK") != NULL, "User delete returns 200 OK");
 }
+
 
 int main(void)
 {

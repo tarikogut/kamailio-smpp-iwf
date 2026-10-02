@@ -18,11 +18,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-int smpp_http_api_enable = 1;
-int smpp_http_api_port = 8080;
-char *smpp_http_api_token = "secret-token-123";
-
 static int http_server_fd = -1;
+
 static volatile int http_server_running = 0;
 static pthread_t http_server_thread;
 static pthread_mutex_t api_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -262,9 +259,209 @@ int smpp_http_api_handle_request(const char *req_buf, size_t req_len, char *resp
         return 0;
     }
 
+    /* 6. GET /api/v1/connections (List All Outbound SMSC Connections & Status) */
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/v1/connections") == 0) {
+        char json[2048] = "{\"connections\":[";
+        smpp_smsc_profile_t *p = smpp_config_get_smsc_list();
+        int first = 1;
+        while (p) {
+            smpp_client_conn_t *c = smpp_client_find(p->smsc_id);
+            char item[256];
+            snprintf(item, sizeof(item),
+                "%s{\"smsc_id\":\"%s\",\"host\":\"%s\",\"port\":%d,\"system_id\":\"%s\",\"status\":\"%s\",\"b_code\":\"%s\"}",
+                first ? "" : ",", p->smsc_id, p->host, p->port, p->system_id,
+                (c && c->state == SMPP_STATE_BOUND_TRX) ? "BOUND_TRX" : "DISCONNECTED",
+                p->default_b_code);
+            strcat(json, item);
+            first = 0;
+            p = p->next;
+        }
+        strcat(json, "]}");
+        make_http_response(200, "OK", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
+    /* 7. POST /api/v1/connections (Add New Outbound SMSC Connection) */
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/v1/connections") == 0) {
+        const char *body_start = strstr(req_buf, "\r\n\r\n");
+        if (!body_start) body_start = strstr(req_buf, "\n\n");
+        if (body_start) body_start += (body_start[0] == '\r') ? 4 : 2;
+
+        smpp_smsc_profile_t sp;
+        memset(&sp, 0, sizeof(sp));
+        sp.port = 2775;
+        strcpy(sp.system_type, "CMT");
+        sp.version = SMPP_VERSION_34;
+        sp.mps_limit = 100;
+
+        if (body_start) {
+            char *p_id = strstr(body_start, "\"smsc_id\":");
+            if (p_id) sscanf(p_id, "\"smsc_id\":\"%31[^\"]\"", sp.smsc_id);
+            char *p_h = strstr(body_start, "\"host\":");
+            if (p_h) sscanf(p_h, "\"host\":\"%127[^\"]\"", sp.host);
+            char *p_p = strstr(body_start, "\"port\":");
+            if (p_p) sscanf(p_p, "\"port\":%d", &sp.port);
+            char *p_sys = strstr(body_start, "\"system_id\":");
+            if (p_sys) sscanf(p_sys, "\"system_id\":\"%31[^\"]\"", sp.system_id);
+            char *p_pwd = strstr(body_start, "\"password\":");
+            if (p_pwd) sscanf(p_pwd, "\"password\":\"%63[^\"]\"", sp.password);
+            char *p_b = strstr(body_start, "\"default_b_code\":");
+            if (p_b) sscanf(p_b, "\"default_b_code\":\"%15[^\"]\"", sp.default_b_code);
+        }
+
+        if (!sp.smsc_id[0] || !sp.host[0]) {
+            make_http_response(400, "Bad Request", "{\"error\":\"Missing required fields ('smsc_id' and 'host')\"}",
+                               resp_buf, max_resp, out_len);
+            return 0;
+        }
+
+        smpp_config_add_smsc(&sp);
+        smpp_client_connect(&sp);
+        char json[256];
+        snprintf(json, sizeof(json), "{\"status\":\"created\",\"smsc_id\":\"%s\",\"message\":\"Connection added and bind initiated\"}", sp.smsc_id);
+        make_http_response(201, "Created", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
+    /* 8. DELETE /api/v1/connections?id=... (Remove SMSC Connection) */
+    if (strcmp(method, "DELETE") == 0 && strncmp(path, "/api/v1/connections", 19) == 0) {
+        char smsc_id[32] = {0};
+        char *id_param = strstr(path, "id=");
+        if (id_param) sscanf(id_param + 3, "%31[^& \t\r\n]", smsc_id);
+
+        if (!smsc_id[0]) {
+            make_http_response(400, "Bad Request", "{\"error\":\"Missing 'id' parameter in query string\"}",
+                               resp_buf, max_resp, out_len);
+            return 0;
+        }
+
+        smpp_client_conn_t *c = smpp_client_find(smsc_id);
+        if (c) smpp_client_disconnect(c);
+        smpp_config_del_smsc(smsc_id);
+
+        char json[256];
+        snprintf(json, sizeof(json), "{\"status\":\"deleted\",\"smsc_id\":\"%s\",\"message\":\"Connection disconnected and removed\"}", smsc_id);
+        make_http_response(200, "OK", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
+    /* 9. POST /api/v1/connections/start?id=... & POST /api/v1/connections/stop?id=... */
+    if (strcmp(method, "POST") == 0 && strncmp(path, "/api/v1/connections/start", 25) == 0) {
+        char smsc_id[32] = {0};
+        char *id_param = strstr(path, "id=");
+        if (id_param) sscanf(id_param + 3, "%31[^& \t\r\n]", smsc_id);
+
+        smpp_smsc_profile_t *p = smpp_config_find_smsc(smsc_id);
+        if (!p) {
+            make_http_response(404, "Not Found", "{\"error\":\"SMSC profile not found\"}", resp_buf, max_resp, out_len);
+            return 0;
+        }
+        smpp_client_conn_t *c = smpp_client_connect(p);
+        char json[256];
+        snprintf(json, sizeof(json), "{\"status\":\"started\",\"smsc_id\":\"%s\",\"state\":\"%s\"}",
+                 smsc_id, (c && c->state == SMPP_STATE_BOUND_TRX) ? "BOUND_TRX" : "CONNECTING");
+        make_http_response(200, "OK", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
+    if (strcmp(method, "POST") == 0 && strncmp(path, "/api/v1/connections/stop", 24) == 0) {
+        char smsc_id[32] = {0};
+        char *id_param = strstr(path, "id=");
+        if (id_param) sscanf(id_param + 3, "%31[^& \t\r\n]", smsc_id);
+
+        smpp_client_conn_t *c = smpp_client_find(smsc_id);
+        if (!c) {
+            make_http_response(404, "Not Found", "{\"error\":\"Active connection not found\"}", resp_buf, max_resp, out_len);
+            return 0;
+        }
+        smpp_client_disconnect(c);
+        char json[256];
+        snprintf(json, sizeof(json), "{\"status\":\"stopped\",\"smsc_id\":\"%s\",\"message\":\"Connection unbound and closed\"}", smsc_id);
+        make_http_response(200, "OK", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
+    /* 10. GET /api/v1/users (List Inbound ESME Accounts) */
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/v1/users") == 0) {
+        char json[2048] = "{\"users\":[";
+        smpp_account_profile_t *acc = smpp_config_get_account_list();
+        int first = 1;
+        while (acc) {
+            char item[256];
+            snprintf(item, sizeof(item),
+                "%s{\"account_id\":\"%s\",\"mps_limit\":%d,\"burst_limit\":%d,\"msgid_format\":\"%s\"}",
+                first ? "" : ",", acc->account_id, acc->mps_limit, acc->burst_limit, acc->msgid_format);
+            strcat(json, item);
+            first = 0;
+            acc = acc->next;
+        }
+        strcat(json, "]}");
+        make_http_response(200, "OK", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
+    /* 11. POST /api/v1/users (Create or Update Inbound ESME Account) */
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/v1/users") == 0) {
+        const char *body_start = strstr(req_buf, "\r\n\r\n");
+        if (!body_start) body_start = strstr(req_buf, "\n\n");
+        if (body_start) body_start += (body_start[0] == '\r') ? 4 : 2;
+
+        smpp_account_profile_t acc;
+        memset(&acc, 0, sizeof(acc));
+        acc.mps_limit = 50;
+        acc.burst_limit = 100;
+        strcpy(acc.msgid_format, "%PREFIX%-%TIMESTAMP%-%HEXSEQ%");
+
+        if (body_start) {
+            char *p_id = strstr(body_start, "\"account_id\":");
+            if (p_id) sscanf(p_id, "\"account_id\":\"%31[^\"]\"", acc.account_id);
+            char *p_pwd = strstr(body_start, "\"password\":");
+            if (p_pwd) sscanf(p_pwd, "\"password\":\"%63[^\"]\"", acc.password);
+            char *p_mps = strstr(body_start, "\"mps_limit\":");
+            if (p_mps) sscanf(p_mps, "\"mps_limit\":%d", &acc.mps_limit);
+            char *p_burst = strstr(body_start, "\"burst_limit\":");
+            if (p_burst) sscanf(p_burst, "\"burst_limit\":%d", &acc.burst_limit);
+            char *p_fmt = strstr(body_start, "\"msgid_format\":");
+            if (p_fmt) sscanf(p_fmt, "\"msgid_format\":\"%63[^\"]\"", acc.msgid_format);
+        }
+
+        if (!acc.account_id[0] || !acc.password[0]) {
+            make_http_response(400, "Bad Request", "{\"error\":\"Missing required fields ('account_id' and 'password')\"}",
+                               resp_buf, max_resp, out_len);
+            return 0;
+        }
+
+        smpp_config_del_account(acc.account_id);
+        smpp_config_add_account(&acc);
+        char json[256];
+        snprintf(json, sizeof(json), "{\"status\":\"success\",\"account_id\":\"%s\",\"message\":\"Account saved successfully\"}", acc.account_id);
+        make_http_response(201, "Created", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
+    /* 12. DELETE /api/v1/users?id=... (Remove Inbound ESME Account) */
+    if (strcmp(method, "DELETE") == 0 && strncmp(path, "/api/v1/users", 13) == 0) {
+        char account_id[32] = {0};
+        char *id_param = strstr(path, "id=");
+        if (id_param) sscanf(id_param + 3, "%31[^& \t\r\n]", account_id);
+
+        if (!account_id[0]) {
+            make_http_response(400, "Bad Request", "{\"error\":\"Missing 'id' parameter in query string\"}",
+                               resp_buf, max_resp, out_len);
+            return 0;
+        }
+
+        smpp_config_del_account(account_id);
+        char json[256];
+        snprintf(json, sizeof(json), "{\"status\":\"deleted\",\"account_id\":\"%s\",\"message\":\"Account removed successfully\"}", account_id);
+        make_http_response(200, "OK", json, resp_buf, max_resp, out_len);
+        return 0;
+    }
+
     make_http_response(404, "Not Found", "{\"error\":\"Endpoint not found\"}", resp_buf, max_resp, out_len);
     return 0;
 }
+
 
 static void *http_worker_thread(void *arg)
 {

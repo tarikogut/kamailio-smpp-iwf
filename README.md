@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Kamailio](https://img.shields.io/badge/Kamailio-v5.x%20%2F%20v6.x-orange.svg)](https://www.kamailio.org)
 [![SMPP](https://img.shields.io/badge/SMPP-v3.4%20%2F%20v5.0-green.svg)](https://smpp.org)
-[![Tests](https://img.shields.io/badge/Tests-98%2F98%20Passing-brightgreen.svg)](test_smpp.c)
+[![Tests](https://img.shields.io/badge/Tests-113%2F113%20Passing-brightgreen.svg)](test_smpp.c)
 
 ---
 
@@ -22,49 +22,125 @@
 - **Token Bucket MPS Hız Sınırlaması (Rate Limiting):** Her müşteri için saniye başına mesaj sınırı (MPS) enforce edilir, sınır aşıldığında anında `ESME_RTHROTTLED` (0x58) döner.
 - **Kara Liste & Sahtecilik Filtresi (Anti-Fraud):** Regex ve anahtar kelime eşleşmesi ile zararlı/kumar mesajları anında `ESME_RMSGBLOCKED` (0x67) ile reddedilir.
 - **ENUM & MNP (Numara Taşınabilirliği) Motoru:** RFC 3761 `e164.arpa` DNS ENUM, yerel yüksek hızlı bellek içi hash tablosu veya Redis dip sorgusu ile taşınmış numaraları tespit eder. Numaranın güncel operatörünü (Routing Number / RN) bularak SMS'i doğrudan doğru operatör trunk'ına (`sim1`, `sim2`, `sim3`) yönlendirir.
-- **Yerleşik REST API Sunucusu (Management, Send, DLR Query):** Port 8080 üzerinde çalışan dahili HTTP/1.1 REST API sunucusu. Bearer Token korumalıdır. Sistem durumu izleme, konfigürasyonu canlı yenileme (`/api/v1/reload`), doğrudan HTTP üzerinden SMS gönderme (`POST /api/v1/sms/send`) ve DLR teslim raporu sorgulama (`GET /api/v1/sms/query?id=...`) yetenekleri sunar.
+- **Tam Kapsamlı REST API (Yönetim, Bağlantı & Kullanıcı CRUD, SMS, DLR):** Port 8080 üzerinde çalışan dahili HTTP/1.1 REST API sunucusu. Bearer Token korumalıdır. Sistem durumu izleme, konfigürasyonu canlı yenileme (`/api/v1/reload`), SMSC bağlantılarını dinamik yönetme (listeleme, ekleme, silme, start/stop), ESME kullanıcılarını yönetme (listeleme, ekleme, silme), doğrudan HTTP üzerinden SMS gönderme (`POST /api/v1/sms/send`) ve DLR teslim raporu sorgulama (`GET /api/v1/sms/query?id=...`) yetenekleri sunar.
 - **Sıfır Kesintiyle Canlı Güncelleme:** `kamcmd smpp.reload` veya HTTP `POST /api/v1/reload` ile oturumları koparmadan bellek içi hesaplar, operatörler ve kara listeler anında güncellenir.
 
-### 3. Dahili REST API (Yönetim, SMS Gönderme ve Rapor Sorgulama)
+### 3. Konfigürasyon Parametreleri (`kamailio.cfg`)
 
-Kamailio SMPP modülü, üçüncü parti web servisleri ve mikroservislerle hızlı entegrasyon için dahili HTTP REST API sunucusu barındırır:
+Kamailio SMPP modülü `modparam("smpp", "parametre_adi", deger)` sözdizimi ile yapılandırılır:
 
-#### REST API Endpoint'leri:
-- `GET /api/v1/health` - Genel sistem sağlık kontrolü (Public, Token gerektirmez).
-- `GET /api/v1/status` - Anlık SMS-IWF durum özeti ve istatistikler.
-- `POST /api/v1/reload` - Aktif oturumları kesmeden anında konfigürasyon yenileme.
-- `POST /api/v1/sms/send` - HTTP JSON ile anında SMS dispatch etme.
-- `GET /api/v1/sms/query?id=<message_id>` - Gerçek zamanlı teslim raporu (DLR) sorgulama.
+| Parametre Adı | Veri Tipi | Varsayılan | Açıklama |
+| :--- | :--- | :--- | :--- |
+| `listen_ip` | `string` | `"0.0.0.0"` | SMPP SMSC sunucusunun dinleyeceği yerel IP adresi. |
+| `listen_port` | `int` | `2775` | SMPP dinleme portu (Örn. `2779`). |
+| `worker_procs` | `int` | `2` | SMPP PDU işleme süreç / thread sayısı. |
+| `enquire_link_interval` | `int` | `30` | Otomatik SMPP keepalive (ping/pong) periyodu (saniye). |
+| `response_timeout` | `int` | `5` | SMSC yanıt bekleme zaman aşımı (saniye). |
+| `reconnect_interval` | `int` | `10` | Bağlantı koptuğunda yeniden bağlanma deneme aralığı. |
+| `default_client_mps` | `int` | `30` | Tanımsız istemciler için varsayılan saniye başına mesaj limiti (MPS). |
+| `msgid_format` | `string` | `"%PREFIX%-%TIMESTAMP%-%HEXSEQ%"` | Genel Mesaj ID şablon formatı (`%PREFIX%`, `%ACCOUNT%`, `%TIMESTAMP%`, `%HEXSEQ%`, `%DECSEQ%`). |
+| `mnp_mode` | `int` | `0` | Numara taşınabilirliği modu: `0`=Kapalı, `1`=DNS ENUM, `2`=Memory Hash, `3`=Redis Dip. |
+| `enum_suffix` | `string` | `"e164.arpa"` | ENUM DNS sorguları için kök alan adı. |
+| `mnp_redis_host` | `string` | `"127.0.0.1"` | MNP sorguları için Redis sunucu adresi. |
+| `mnp_cache_ttl` | `int` | `3600` | MNP sonuçları için bellek içi önbellek süresi (saniye). |
+| `http_api_enable` | `int` | `1` | Dahili HTTP REST API sunucusunu etkinleştirir (`1`) veya kapatır (`0`). |
+| `http_api_port` | `int` | `8080` | REST API dinleme portu. |
+| `http_api_token` | `string` | `"secret-token-123"` | **Tüm korumalı REST API endpoint'leri için zorunlu Bearer Token.** |
 
-#### REST API Örnek Kullanımları (`curl`):
+---
+
+### 4. Dahili REST API (Yönetim, Bağlantı & Kullanıcı CRUD, SMS ve Rapor)
+
+Kamailio SMPP modülü, web panelleri ve mikroservislerle entegrasyon için tam teşekküllü CRUD REST API sunar:
+
+#### REST API Endpoint Matrisi:
+| Metot | Endpoint | Yetki | Açıklama |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/api/v1/health` | Public | Liveness ve sistem sağlık kontrolü. |
+| `GET` | `/api/v1/status` | Bearer Token | Anlık SMS-IWF istatistikleri ve durum özeti. |
+| `POST` | `/api/v1/reload` | Bearer Token | Sıfır kesintiyle canlı konfigürasyon yenileme. |
+| `POST` | `/api/v1/sms/send` | Bearer Token | HTTP JSON ile anında SMS dispatch etme. |
+| `GET` | `/api/v1/sms/query?id=...`| Bearer Token | Gerçek zamanlı DLR / teslimat raporu sorgulama. |
+| `GET` | `/api/v1/connections` | Bearer Token | Tüm outbound SMSC bağlantılarını ve durumlarını listeleme. |
+| `POST` | `/api/v1/connections` | Bearer Token | Canlı yeni outbound SMSC bağlantısı ekleme & bind etme. |
+| `DELETE` | `/api/v1/connections?id=...`| Bearer Token | Aktif SMSC bağlantısını koparma ve silme. |
+| `POST` | `/api/v1/connections/start?id=...`| Bearer Token | Belirli bir SMSC bağlantısını canlı başlatma (TRX Bind). |
+| `POST` | `/api/v1/connections/stop?id=...`| Bearer Token | Belirli bir SMSC bağlantısını durdurma (Unbind). |
+| `GET` | `/api/v1/users` | Bearer Token | Tanımlı tüm inbound ESME istemci hesaplarını listeleme. |
+| `POST` | `/api/v1/users` | Bearer Token | Yeni ESME kullanıcısı ekleme veya güncelleme. |
+| `DELETE` | `/api/v1/users?id=...` | Bearer Token | ESME kullanıcısını silme. |
+
+#### REST API Operasyonel Kullanım Örnekleri (`curl`):
 
 ```bash
-# 1. Sağlık Kontrolü
+# 1. Sağlık Kontrolü (Public)
 curl -i http://127.0.0.1:8080/api/v1/health
 
-# 2. Sistem Durumu ve İstatistikler
+# 2. Sistem Durumu ve Metrikler
 curl -i http://127.0.0.1:8080/api/v1/status \
   -H "Authorization: Bearer secret-token-123"
 
-# 3. Sıfır Kesintiyle Canlı Konfigürasyon Yenileme (Hot-Reload)
-curl -i -X POST http://127.0.0.1:8080/api/v1/reload \
+# 3. Canlı Yeni Operatör/SMSC Bağlantısı Ekleme (POST)
+curl -i -X POST http://127.0.0.1:8080/api/v1/connections \
+  -H "Authorization: Bearer secret-token-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "smsc_id": "turkcell_new",
+    "host": "192.168.1.50",
+    "port": 2775,
+    "system_id": "kamailio_gw",
+    "password": "operator_password",
+    "default_b_code": "B251"
+  }'
+
+# 4. Operatör Bağlantısını Durdurma (Stop / Unbind)
+curl -i -X POST "http://127.0.0.1:8080/api/v1/connections/stop?id=turkcell_new" \
   -H "Authorization: Bearer secret-token-123"
 
-# 4. HTTP Üzerinden SMS Gönderme (SMS Dispatch)
+# 5. Operatör Bağlantısını Başlatma (Start / Bind)
+curl -i -X POST "http://127.0.0.1:8080/api/v1/connections/start?id=turkcell_new" \
+  -H "Authorization: Bearer secret-token-123"
+
+# 6. Operatör Bağlantısını Silme (DELETE)
+curl -i -X DELETE "http://127.0.0.1:8080/api/v1/connections?id=turkcell_new" \
+  -H "Authorization: Bearer secret-token-123"
+
+# 7. Yeni ESME Müşteri Hesabı Ekleme (POST User)
+curl -i -X POST http://127.0.0.1:8080/api/v1/users \
+  -H "Authorization: Bearer secret-token-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "account_id": "bank_client",
+    "password": "bank_secure_password",
+    "mps_limit": 150,
+    "burst_limit": 300,
+    "msgid_format": "BANK-%TIMESTAMP%-%HEXSEQ%"
+  }'
+
+# 8. Tanımlı ESME Hesaplarını Listeleme (GET Users)
+curl -i http://127.0.0.1:8080/api/v1/users \
+  -H "Authorization: Bearer secret-token-123"
+
+# 9. ESME Hesabı Silme (DELETE User)
+curl -i -X DELETE "http://127.0.0.1:8080/api/v1/users?id=bank_client" \
+  -H "Authorization: Bearer secret-token-123"
+
+# 10. HTTP Üzerinden SMS Gönderme
 curl -i -X POST http://127.0.0.1:8080/api/v1/sms/send \
   -H "Authorization: Bearer secret-token-123" \
   -H "Content-Type: application/json" \
   -d '{
     "smsc_id": "sim1",
     "from": "KAMAILIO",
-    "to": "905321234567",
+    "to": "905321000000",
     "text": "Merhaba! Kamailio SMS-IWF REST API testi."
   }'
 
-# 5. DLR / Teslimat Raporu Sorgulama
+# 11. DLR / Teslimat Raporu Sorgulama
 curl -i "http://127.0.0.1:8080/api/v1/sms/query?id=REST-20261002070000-03E9" \
   -H "Authorization: Bearer secret-token-123"
 ```
+
 
 ### 4. Hızlı Kurulum & Çalıştırma (Docker)
 
@@ -147,46 +223,121 @@ It eliminates the need for middleman SMS gateways (such as Kannel or Jasmin), ro
 - **In-Memory Token Bucket MPS Rate Limiter:** Per-account strict throttling with instant `ESME_RTHROTTLED` (`0x58`) and v5.0 `congestion_state` TLV feedback.
 - **Anti-Fraud & Regex Blacklist Engine:** Drops or rejects spam/phishing with `ESME_RMSGBLOCKED` (`0x67`).
 - **ENUM & MNP (Mobile Number Portability) Engine:** Supports RFC 3761 `e164.arpa` DNS ENUM, high-speed in-memory hash tables, or Redis database dips to identify ported numbers. Dynamically queries the recipient's Routing Number (RN) and routes SMS to the destination carrier (`sim1`, `sim2`, `sim3`) with optimal LCR cost.
-- **Built-in REST API Server (Management, Send & DLR Query):** Micro HTTP/1.1 REST API server on port 8080. Protected by Bearer token authorization. Provides live health check, system status overview, zero-downtime hot reloading (`POST /api/v1/reload`), SMS dispatch (`POST /api/v1/sms/send`), and real-time delivery receipt querying (`GET /api/v1/sms/query?id=...`).
+- **Carrier-Grade CRUD REST API Engine (Connections, Users, SMS, DLR):** Micro HTTP/1.1 REST API server running on port 8080. Protected by Bearer token authorization. Supports health check, live statistics, zero-downtime hot reloading (`POST /api/v1/reload`), dynamic SMSC connection lifecycle management (list, add, delete, start, stop), dynamic ESME user management (list, add, delete), HTTP-based SMS dispatch (`POST /api/v1/sms/send`), and real-time delivery receipt querying (`GET /api/v1/sms/query?id=...`).
 - **Zero-Downtime Hot Reloading:** Live configuration reload without dropping active TCP binds via `kamcmd smpp.reload` or HTTP `POST /api/v1/reload`.
 
-### 3. Built-in REST API (Management, SMS Dispatch, DLR Query)
+### 3. Module Configuration Parameters (`kamailio.cfg`)
 
-Kamailio SMPP includes an embedded HTTP REST API engine for seamless integration with microservices and external CPaaS applications:
+The Kamailio SMPP module is configured using standard `modparam("smpp", "parameter_name", value)` directives:
 
-#### Available Endpoints:
-- `GET /api/v1/health` - Liveness & health check (Public).
-- `GET /api/v1/status` - Live SMS-IWF statistics and configuration overview.
-- `POST /api/v1/reload` - Zero-downtime hot reload without dropping active SMPP binds.
-- `POST /api/v1/sms/send` - Send SMS via HTTP JSON.
-- `GET /api/v1/sms/query?id=<message_id>` - Real-time DLR and message state query.
+| Parameter Name | Data Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `listen_ip` | `string` | `"0.0.0.0"` | Local IP address for the SMPP SMSC server to bind and listen on. |
+| `listen_port` | `int` | `2775` | SMPP listener port (e.g., `2779`). |
+| `worker_procs` | `int` | `2` | Number of SMPP PDU processing workers / worker threads. |
+| `enquire_link_interval` | `int` | `30` | Automatic SMPP keepalive (ping/pong) heartbeat interval in seconds. |
+| `response_timeout` | `int` | `5` | Upstream SMSC response timeout in seconds. |
+| `reconnect_interval` | `int` | `10` | Automatic reconnect attempt backoff interval upon connection drop. |
+| `default_client_mps` | `int` | `30` | Default Messages-Per-Second (MPS) limit for unmetered clients. |
+| `msgid_format` | `string` | `"%PREFIX%-%TIMESTAMP%-%HEXSEQ%"` | Global Message ID template pattern (`%PREFIX%`, `%ACCOUNT%`, `%TIMESTAMP%`, `%HEXSEQ%`, `%DECSEQ%`). |
+| `mnp_mode` | `int` | `0` | Number portability resolution engine: `0`=Off, `1`=DNS ENUM, `2`=Memory Hash, `3`=Redis Dip. |
+| `enum_suffix` | `string` | `"e164.arpa"` | Root DNS domain for RFC 3761 ENUM lookups. |
+| `mnp_redis_host` | `string` | `"127.0.0.1"` | Redis server address for MNP database dips. |
+| `mnp_cache_ttl` | `int` | `3600` | In-memory cache TTL for MNP resolution results in seconds. |
+| `http_api_enable` | `int` | `1` | Enables (`1`) or disables (`0`) the embedded HTTP REST API server. |
+| `http_api_port` | `int` | `8080` | HTTP REST API listening port. |
+| `http_api_token` | `string` | `"secret-token-123"` | **Mandatory Bearer Token required for all protected REST API endpoints.** |
 
-#### Quick `curl` Examples:
+---
+
+### 4. Built-in REST API (Management, Connection & User CRUD, SMS Dispatch, DLR Query)
+
+Kamailio SMPP provides an embedded, zero-overhead HTTP/1.1 REST API engine for seamless integration with modern web dashboards, CPaaS orchestrators, and microservices:
+
+#### REST API Endpoint Matrix:
+| Method | Endpoint | Auth | Description |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/api/v1/health` | Public | Liveness probe and service health check. |
+| `GET` | `/api/v1/status` | Bearer Token | Live SMS-IWF operational metrics and configuration state. |
+| `POST` | `/api/v1/reload` | Bearer Token | Zero-downtime hot reload without terminating active binds. |
+| `POST` | `/api/v1/sms/send` | Bearer Token | Instant SMS dispatch via HTTP JSON payload. |
+| `GET` | `/api/v1/sms/query?id=...`| Bearer Token | Real-time DLR and message delivery state inquiry. |
+| `GET` | `/api/v1/connections` | Bearer Token | List all outbound SMSC carrier connections and link states. |
+| `POST` | `/api/v1/connections` | Bearer Token | Dynamically add and bind a new outbound SMSC connection in runtime. |
+| `DELETE` | `/api/v1/connections?id=...`| Bearer Token | Gracefully unbind and remove an outbound SMSC connection. |
+| `POST` | `/api/v1/connections/start?id=...`| Bearer Token | Trigger manual start/bind for a specific SMSC connection. |
+| `POST` | `/api/v1/connections/stop?id=...`| Bearer Token | Trigger manual stop/unbind for a specific SMSC connection. |
+| `GET` | `/api/v1/users` | Bearer Token | List all configured inbound ESME client accounts. |
+| `POST` | `/api/v1/users` | Bearer Token | Dynamically create or update an ESME client user account. |
+| `DELETE` | `/api/v1/users?id=...` | Bearer Token | Remove an ESME client user account. |
+
+#### Operational `curl` Examples:
 
 ```bash
-# 1. Health Check
+# 1. Health Check (Public)
 curl -i http://127.0.0.1:8080/api/v1/health
 
-# 2. System Status Overview
+# 2. Operational Status & Metrics
 curl -i http://127.0.0.1:8080/api/v1/status \
   -H "Authorization: Bearer secret-token-123"
 
-# 3. Hot Configuration Reload
-curl -i -X POST http://127.0.0.1:8080/api/v1/reload \
+# 3. Add Dynamic SMSC Carrier Connection (POST Connection)
+curl -i -X POST http://127.0.0.1:8080/api/v1/connections \
+  -H "Authorization: Bearer secret-token-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "smsc_id": "carrier_fast",
+    "host": "192.168.1.50",
+    "port": 2775,
+    "system_id": "kamailio_gw",
+    "password": "carrier_password",
+    "default_b_code": "B251"
+  }'
+
+# 4. Stop SMSC Carrier Connection (Stop / Unbind)
+curl -i -X POST "http://127.0.0.1:8080/api/v1/connections/stop?id=carrier_fast" \
   -H "Authorization: Bearer secret-token-123"
 
-# 4. Dispatch SMS via REST API
+# 5. Start SMSC Carrier Connection (Start / Bind)
+curl -i -X POST "http://127.0.0.1:8080/api/v1/connections/start?id=carrier_fast" \
+  -H "Authorization: Bearer secret-token-123"
+
+# 6. Delete SMSC Carrier Connection (DELETE Connection)
+curl -i -X DELETE "http://127.0.0.1:8080/api/v1/connections?id=carrier_fast" \
+  -H "Authorization: Bearer secret-token-123"
+
+# 7. Create New Inbound ESME User Account (POST User)
+curl -i -X POST http://127.0.0.1:8080/api/v1/users \
+  -H "Authorization: Bearer secret-token-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "account_id": "fintech_client",
+    "password": "strong_auth_token",
+    "mps_limit": 200,
+    "burst_limit": 400,
+    "msgid_format": "FIN-%TIMESTAMP%-%HEXSEQ%"
+  }'
+
+# 8. List Configured ESME Accounts (GET Users)
+curl -i http://127.0.0.1:8080/api/v1/users \
+  -H "Authorization: Bearer secret-token-123"
+
+# 9. Delete ESME User Account (DELETE User)
+curl -i -X DELETE "http://127.0.0.1:8080/api/v1/users?id=fintech_client" \
+  -H "Authorization: Bearer secret-token-123"
+
+# 10. Send SMS via HTTP JSON API
 curl -i -X POST http://127.0.0.1:8080/api/v1/sms/send \
   -H "Authorization: Bearer secret-token-123" \
   -H "Content-Type: application/json" \
   -d '{
     "smsc_id": "sim1",
     "from": "KAMAILIO",
-    "to": "905321234567",
+    "to": "905321000000",
     "text": "Hello from Kamailio SMS-IWF REST API!"
   }'
 
-# 5. Query Delivery Status (DLR)
+# 11. Query Delivery Status (DLR)
 curl -i "http://127.0.0.1:8080/api/v1/sms/query?id=REST-20261002070000-03E9" \
   -H "Authorization: Bearer secret-token-123"
 ```

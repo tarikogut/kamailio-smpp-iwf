@@ -44,12 +44,17 @@ int smpp_config_init(void);
 void smpp_config_destroy(void);
 
 int smpp_config_add_smsc(const smpp_smsc_profile_t *profile);
+int smpp_config_del_smsc(const char *smsc_id);
 smpp_smsc_profile_t *smpp_config_find_smsc(const char *smsc_id);
+smpp_smsc_profile_t *smpp_config_get_smsc_list(void);
 
 int smpp_config_add_account(const smpp_account_profile_t *profile);
+int smpp_config_del_account(const char *account_id);
 smpp_account_profile_t *smpp_config_find_account(const char *account_id);
+smpp_account_profile_t *smpp_config_get_account_list(void);
 
 /* Reload all configuration in shared memory atomically */
 int smpp_config_reload(void);
 
 #endif /* _SMPP_CONFIG_H_ */
+

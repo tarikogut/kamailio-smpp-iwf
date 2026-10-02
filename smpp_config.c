@@ -92,6 +92,54 @@ int smpp_config_add_account(const smpp_account_profile_t *profile)
     return 0;
 }
 
+int smpp_config_del_smsc(const char *smsc_id)
+{
+    if (!smsc_id) return -1;
+    pthread_mutex_lock(&config_mutex);
+    smpp_smsc_profile_t **curr = &smsc_list;
+    while (*curr) {
+        if (strcmp((*curr)->smsc_id, smsc_id) == 0) {
+            smpp_smsc_profile_t *to_free = *curr;
+            *curr = (*curr)->next;
+            free(to_free);
+            pthread_mutex_unlock(&config_mutex);
+            return 0;
+        }
+        curr = &((*curr)->next);
+    }
+    pthread_mutex_unlock(&config_mutex);
+    return -1;
+}
+
+smpp_smsc_profile_t *smpp_config_get_smsc_list(void)
+{
+    return smsc_list;
+}
+
+int smpp_config_del_account(const char *account_id)
+{
+    if (!account_id) return -1;
+    pthread_mutex_lock(&config_mutex);
+    smpp_account_profile_t **curr = &account_list;
+    while (*curr) {
+        if (strcmp((*curr)->account_id, account_id) == 0) {
+            smpp_account_profile_t *to_free = *curr;
+            *curr = (*curr)->next;
+            free(to_free);
+            pthread_mutex_unlock(&config_mutex);
+            return 0;
+        }
+        curr = &((*curr)->next);
+    }
+    pthread_mutex_unlock(&config_mutex);
+    return -1;
+}
+
+smpp_account_profile_t *smpp_config_get_account_list(void)
+{
+    return account_list;
+}
+
 smpp_account_profile_t *smpp_config_find_account(const char *account_id)
 {
     if (!account_id) return NULL;
@@ -111,6 +159,6 @@ smpp_account_profile_t *smpp_config_find_account(const char *account_id)
 
 int smpp_config_reload(void)
 {
-    /* Atomic hot reload - in real DB deployment, loads new list and swaps pointers */
     return 0;
 }
+
