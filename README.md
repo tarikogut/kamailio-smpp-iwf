@@ -1,10 +1,12 @@
 # Kamailio SMS-IWF & Carrier-Grade SMPP Module
 ### Native SMS Interworking Function (SMS-IWF) & IP-SM-GW for Kamailio SIP Server
 
+[![Author](https://img.shields.io/badge/Author-Tarik%20Ogut-blue.svg)](mailto:tarik@icell.cloud)
+[![Website](https://img.shields.io/badge/Website-icell.cloud-purple.svg)](https://icell.cloud)
 [![License](https://img.shields.io/badge/License-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Kamailio](https://img.shields.io/badge/Kamailio-v5.x%20%2F%20v6.x-orange.svg)](https://www.kamailio.org)
 [![SMPP](https://img.shields.io/badge/SMPP-v3.4%20%2F%20v5.0-green.svg)](https://smpp.org)
-[![Tests](https://img.shields.io/badge/Tests-113%2F113%20Passing-brightgreen.svg)](test_smpp.c)
+[![Tests](https://img.shields.io/badge/Tests-213%2F213%20Passing-brightgreen.svg)](test_smpp.c)
 
 ---
 
@@ -462,10 +464,17 @@ request_route {
 ```bash
 gcc -Wall -O2 test_smpp.c smpp_pdu.c smpp_tlv.c smpp_manip.c smpp_ratelimit.c \
   smpp_nli.c smpp_interwork.c smpp_dlr.c smpp_config.c smpp_client.c \
-  smpp_server.c smpp_mnp.c smpp_http_api.c smpp_concat.c -lpthread -o test_smpp && ./test_smpp
+  smpp_server.c smpp_mnp.c smpp_http_api.c smpp_concat.c smpp_charging.c \
+  -lpthread -o test_smpp && ./test_smpp
 ```
-Result: **15 Test Suites, 210 Tests Passed, 0 Failures.**
+Result: **18 Test Suites, 213 Tests Passed, 0 Failures.**
 
+---
+
+### Author & Maintainer
+- **Lead Architect:** Tarık Öğüt
+- **Email:** [tarik@icell.cloud](mailto:tarik@icell.cloud)
+- **Website:** [https://icell.cloud](https://icell.cloud)
 
 ---
 
