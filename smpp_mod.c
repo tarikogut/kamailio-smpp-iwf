@@ -49,6 +49,7 @@ static int mod_init(void);
 static int child_init(int rank);
 static void destroy(void);
 static int on_server_submit(smpp_server_session_t *sess, const smpp_msg_t *msg, char *out_msg_id);
+static void on_client_deliver(const char *smsc_id, const smpp_msg_t *msg);
 
 /* Script Commands Prototypes */
 static int w_smpp_send(struct sip_msg *msg, char *smsc, char *src, char *dst, char *text);
@@ -200,8 +201,49 @@ static int mod_init(void)
         }
     }
 
+    smpp_client_set_deliver_cb(on_client_deliver);
+
     return 0;
 }
+
+static void on_client_deliver(const char *smsc_id, const smpp_msg_t *msg)
+{
+    if (!msg) return;
+
+    /* Normalize DLR */
+    smpp_dlr_info_t dlr;
+    if (smpp_dlr_normalize(msg, &dlr) == 0) {
+        LM_INFO("Received DLR from SMSC '%s' for MsgID '%s': Status='%s' (was_tlv_only=%d)\n",
+                smsc_id ? smsc_id : "unknown", dlr.message_id, dlr.stat_str, dlr.was_tlv_only);
+
+        /* Update REST API tracker */
+        smpp_http_api_record_msg(dlr.message_id, msg->source_addr, msg->destination_addr,
+                                 dlr.stat_str, smsc_id ? smsc_id : "sim1");
+
+        /* If body was reconstructed or empty, ensure standard body */
+        char healed_body[SMPP_MAX_SHORT_MSG_LEN];
+        size_t b_len = msg->sm_length;
+        if (b_len > 0) {
+            memcpy(healed_body, msg->short_message, b_len);
+            healed_body[b_len] = '\0';
+        } else {
+            smpp_dlr_reconstruct_body(&dlr, healed_body, sizeof(healed_body));
+            b_len = strlen(healed_body);
+        }
+
+        /* Forward deliver_sm to all bound transceiver/receiver client ESMEs */
+        int forwarded = smpp_server_send_deliver_sm(NULL, msg->source_addr, msg->destination_addr,
+                                                    (const uint8_t *)healed_body, (uint8_t)b_len, msg->esm_class);
+        LM_INFO("Forwarded deliver_sm (DLR) to %d connected ESME client(s)\n", forwarded);
+    } else {
+        /* Standard inbound MO SMS */
+        int forwarded = smpp_server_send_deliver_sm(NULL, msg->source_addr, msg->destination_addr,
+                                                    msg->short_message, msg->sm_length, msg->esm_class);
+        LM_INFO("Forwarded inbound MO SMS from '%s' to %d connected ESME client(s)\n",
+                msg->source_addr, forwarded);
+    }
+}
+
 
 static int child_init(int rank)
 {

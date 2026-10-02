@@ -34,4 +34,9 @@ void smpp_server_set_submit_cb(smpp_server_submit_cb_t cb);
 int smpp_server_handle_pdu(smpp_server_session_t *sess, const uint8_t *in_buf, size_t in_len,
                            uint8_t *out_buf, size_t max_out, size_t *out_len);
 
+/* Send a deliver_sm (DLR or Inbound MO) to connected server clients */
+int smpp_server_send_deliver_sm(const char *account_id, const char *src, const char *dst,
+                                const uint8_t *msg_data, uint8_t msg_len, uint8_t esm_class);
+
 #endif /* _SMPP_SERVER_H_ */
+

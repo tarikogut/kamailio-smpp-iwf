@@ -18,6 +18,66 @@
 
 static smpp_client_conn_t *client_conns = NULL;
 static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
+static smpp_client_deliver_cb_t client_deliver_cb = NULL;
+
+void smpp_client_set_deliver_cb(smpp_client_deliver_cb_t cb)
+{
+    pthread_mutex_lock(&client_mutex);
+    client_deliver_cb = cb;
+    pthread_mutex_unlock(&client_mutex);
+}
+
+static void *client_rx_thread_func(void *arg)
+{
+    smpp_client_conn_t *conn = (smpp_client_conn_t *)arg;
+    if (!conn) return NULL;
+
+    uint8_t rx_buf[4096];
+
+    while (conn->running && conn->state == SMPP_STATE_BOUND_TRX && conn->sock_fd >= 0) {
+        ssize_t n = recv(conn->sock_fd, rx_buf, sizeof(rx_buf), 0);
+        if (n <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            break;
+        }
+
+        smpp_pdu_t pdu;
+        if (smpp_pdu_unpack(rx_buf, (size_t)n, &pdu) == 0) {
+            if (pdu.header.command_id == SMPP_CMD_DELIVER_SM) {
+                /* Acknowledge deliver_sm immediately back to SMSC */
+                smpp_pdu_t d_resp;
+                memset(&d_resp, 0, sizeof(d_resp));
+                smpp_header_init(&d_resp.header, SMPP_CMD_DELIVER_SM_RESP, ESME_ROK, pdu.header.sequence_number);
+                uint8_t d_tx[64];
+                size_t d_tx_len = 0;
+                if (smpp_pdu_pack(&d_resp, d_tx, sizeof(d_tx), &d_tx_len) == 0) {
+                    send(conn->sock_fd, d_tx, d_tx_len, 0);
+                }
+
+                pthread_mutex_lock(&client_mutex);
+                smpp_client_deliver_cb_t cb = client_deliver_cb;
+                pthread_mutex_unlock(&client_mutex);
+
+                if (cb) {
+                    cb(conn->smsc_id, &pdu.body.msg);
+                }
+            } else if (pdu.header.command_id == SMPP_CMD_ENQUIRE_LINK) {
+                smpp_pdu_t el_resp;
+                memset(&el_resp, 0, sizeof(el_resp));
+                smpp_make_enquire_link_resp(&el_resp, pdu.header.sequence_number);
+                uint8_t el_tx[64];
+                size_t el_tx_len = 0;
+                if (smpp_pdu_pack(&el_resp, el_tx, sizeof(el_tx), &el_tx_len) == 0) {
+                    send(conn->sock_fd, el_tx, el_tx_len, 0);
+                }
+            }
+            smpp_pdu_free(&pdu);
+        }
+    }
+    return NULL;
+}
 
 int smpp_client_init(void)
 {
@@ -26,6 +86,8 @@ int smpp_client_init(void)
     pthread_mutex_unlock(&client_mutex);
     return 0;
 }
+
+
 
 void smpp_client_destroy(void)
 {
@@ -132,6 +194,11 @@ smpp_client_conn_t *smpp_client_connect(const smpp_smsc_profile_t *profile)
         }
     }
 
+    if (conn->state == SMPP_STATE_BOUND_TRX) {
+        conn->running = 1;
+        pthread_create(&conn->rx_thread, NULL, client_rx_thread_func, conn);
+    }
+
     pthread_mutex_lock(&client_mutex);
     conn->next = client_conns;
     client_conns = conn;
@@ -139,6 +206,7 @@ smpp_client_conn_t *smpp_client_connect(const smpp_smsc_profile_t *profile)
 
     return conn;
 }
+
 
 int smpp_client_disconnect(smpp_client_conn_t *conn)
 {
@@ -195,23 +263,65 @@ int smpp_client_send_submit_sm(smpp_client_conn_t *conn, const char *src, const 
 
     if (send(conn->sock_fd, tx_buf, tx_len, 0) < 0) return -3;
 
-    /* Read submit_sm_resp */
-    uint8_t rx_buf[1024];
-    ssize_t rx_len = recv(conn->sock_fd, rx_buf, sizeof(rx_buf), 0);
-    if (rx_len < SMPP_HEADER_LEN) return -4;
+    if (send(conn->sock_fd, tx_buf, tx_len, 0) < 0) return -3;
 
-    smpp_pdu_t resp;
-    if (smpp_pdu_unpack(rx_buf, (size_t)rx_len, &resp) < 0) return -5;
+    /* Read submit_sm_resp (or handle deliver_sm/enquire_link if interleaved) */
+    int res = -4;
+    while (1) {
+        uint8_t rx_buf[2048];
+        ssize_t rx_len = recv(conn->sock_fd, rx_buf, sizeof(rx_buf), 0);
+        if (rx_len < SMPP_HEADER_LEN) break;
 
-    int res = (resp.header.command_status == ESME_ROK) ? 0 : (int)resp.header.command_status;
-    if (res == 0 && out_msg_id) {
-        strncpy(out_msg_id, resp.body.msg_resp.message_id, 64);
-        out_msg_id[64] = '\0';
+        smpp_pdu_t resp;
+        if (smpp_pdu_unpack(rx_buf, (size_t)rx_len, &resp) < 0) {
+            res = -5;
+            break;
+        }
+
+        if (resp.header.command_id == SMPP_CMD_SUBMIT_SM_RESP) {
+            res = (resp.header.command_status == ESME_ROK) ? 0 : (int)resp.header.command_status;
+            if (res == 0 && out_msg_id) {
+                strncpy(out_msg_id, resp.body.msg_resp.message_id, 64);
+                out_msg_id[64] = '\0';
+            }
+            smpp_pdu_free(&resp);
+            break;
+        } else if (resp.header.command_id == SMPP_CMD_DELIVER_SM) {
+            /* Acknowledge deliver_sm immediately */
+            smpp_pdu_t d_resp;
+            memset(&d_resp, 0, sizeof(d_resp));
+            smpp_header_init(&d_resp.header, SMPP_CMD_DELIVER_SM_RESP, ESME_ROK, resp.header.sequence_number);
+            uint8_t d_tx[64];
+            size_t d_tx_len = 0;
+            if (smpp_pdu_pack(&d_resp, d_tx, sizeof(d_tx), &d_tx_len) == 0) {
+                send(conn->sock_fd, d_tx, d_tx_len, 0);
+            }
+
+            pthread_mutex_lock(&client_mutex);
+            smpp_client_deliver_cb_t cb = client_deliver_cb;
+            pthread_mutex_unlock(&client_mutex);
+            if (cb) {
+                cb(conn->smsc_id, &resp.body.msg);
+            }
+            smpp_pdu_free(&resp);
+        } else if (resp.header.command_id == SMPP_CMD_ENQUIRE_LINK) {
+            smpp_pdu_t el_resp;
+            memset(&el_resp, 0, sizeof(el_resp));
+            smpp_make_enquire_link_resp(&el_resp, resp.header.sequence_number);
+            uint8_t el_tx[64];
+            size_t el_tx_len = 0;
+            if (smpp_pdu_pack(&el_resp, el_tx, sizeof(el_tx), &el_tx_len) == 0) {
+                send(conn->sock_fd, el_tx, el_tx_len, 0);
+            }
+            smpp_pdu_free(&resp);
+        } else {
+            smpp_pdu_free(&resp);
+        }
     }
 
-    smpp_pdu_free(&resp);
     return res;
 }
+
 
 int smpp_client_send_enquire_link(smpp_client_conn_t *conn)
 {

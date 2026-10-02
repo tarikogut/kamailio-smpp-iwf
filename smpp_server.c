@@ -33,6 +33,68 @@ void smpp_server_set_submit_cb(smpp_server_submit_cb_t cb)
     pthread_mutex_unlock(&server_mutex);
 }
 
+static smpp_server_session_t *active_sessions = NULL;
+static pthread_mutex_t sessions_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void register_active_session(smpp_server_session_t *sess)
+{
+    pthread_mutex_lock(&sessions_mutex);
+    sess->next = active_sessions;
+    active_sessions = sess;
+    pthread_mutex_unlock(&sessions_mutex);
+}
+
+static void unregister_active_session(smpp_server_session_t *sess)
+{
+    pthread_mutex_lock(&sessions_mutex);
+    smpp_server_session_t **curr = &active_sessions;
+    while (*curr) {
+        if (*curr == sess) {
+            *curr = sess->next;
+            break;
+        }
+        curr = &((*curr)->next);
+    }
+    pthread_mutex_unlock(&sessions_mutex);
+}
+
+int smpp_server_send_deliver_sm(const char *account_id, const char *src, const char *dst,
+                                const uint8_t *msg_data, uint8_t msg_len, uint8_t esm_class)
+{
+    pthread_mutex_lock(&sessions_mutex);
+    smpp_server_session_t *curr = active_sessions;
+    int sent_count = 0;
+
+    while (curr) {
+        if (!account_id || curr->account_id[0] == '\0' || strcmp(curr->account_id, account_id) == 0) {
+            if (curr->state == SMPP_STATE_BOUND_TRX || curr->state == SMPP_STATE_BOUND_RX) {
+                smpp_pdu_t deliver_pdu;
+                memset(&deliver_pdu, 0, sizeof(deliver_pdu));
+                smpp_header_init(&deliver_pdu.header, SMPP_CMD_DELIVER_SM, ESME_ROK, ++global_msg_counter);
+                
+                if (src) strncpy(deliver_pdu.body.msg.source_addr, src, sizeof(deliver_pdu.body.msg.source_addr) - 1);
+                if (dst) strncpy(deliver_pdu.body.msg.destination_addr, dst, sizeof(deliver_pdu.body.msg.destination_addr) - 1);
+                deliver_pdu.body.msg.esm_class = esm_class;
+                deliver_pdu.body.msg.data_coding = 0; /* GSM 7-bit default */
+                deliver_pdu.body.msg.sm_length = msg_len;
+                if (msg_data && msg_len > 0) {
+                    memcpy(deliver_pdu.body.msg.short_message, msg_data, msg_len);
+                }
+
+                uint8_t tx_buf[2048];
+                size_t tx_len = 0;
+                if (smpp_pdu_pack(&deliver_pdu, tx_buf, sizeof(tx_buf), &tx_len) == 0) {
+                    send(curr->client_fd, tx_buf, tx_len, 0);
+                    sent_count++;
+                }
+            }
+        }
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&sessions_mutex);
+    return sent_count;
+}
+
 static void *client_worker_thread(void *arg)
 {
     int cfd = (int)(intptr_t)arg;
@@ -40,6 +102,7 @@ static void *client_worker_thread(void *arg)
     memset(&sess, 0, sizeof(sess));
     sess.client_fd = cfd;
     sess.state = SMPP_STATE_CONNECTED;
+    register_active_session(&sess);
 
     uint8_t rx_buf[4096];
     uint8_t tx_buf[4096];
@@ -55,9 +118,11 @@ static void *client_worker_thread(void *arg)
         }
     }
 
+    unregister_active_session(&sess);
     close(cfd);
     return NULL;
 }
+
 
 static void *server_listener_thread(void *arg)
 {

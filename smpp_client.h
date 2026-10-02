@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <pthread.h>
 #include "smpp_pdu.h"
 #include "smpp_config.h"
 
@@ -29,8 +30,14 @@ typedef struct smpp_client_conn {
     uint32_t sequence_number;
     uint64_t last_activity_ms;
     smpp_smsc_profile_t profile;
+    pthread_t rx_thread;
+    volatile int running;
     struct smpp_client_conn *next;
 } smpp_client_conn_t;
+
+/* Callback when client receives deliver_sm (DLR or Inbound MO SMS) from SMSC */
+typedef void (*smpp_client_deliver_cb_t)(const char *smsc_id, const smpp_msg_t *msg);
+void smpp_client_set_deliver_cb(smpp_client_deliver_cb_t cb);
 
 int smpp_client_init(void);
 void smpp_client_destroy(void);
@@ -47,3 +54,4 @@ int smpp_client_send_enquire_link(smpp_client_conn_t *conn);
 smpp_client_conn_t *smpp_client_find(const char *smsc_id);
 
 #endif /* _SMPP_CLIENT_H_ */
+
